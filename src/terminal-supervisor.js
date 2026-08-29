@@ -36,7 +36,11 @@ function probeHttp(port, timeoutMs = 4000) {
       response.on('data', chunk => { if (body.length < 65536) body += chunk })
       response.on('end', () => {
         const text = `${body} ${JSON.stringify(response.headers)}`.toLowerCase()
-        const harness = text.includes('deepseek') || text.includes('__dsh_boot__') || text.includes('harness')
+        // ★ 1.3.1：新版 DSH（0.1.2-alpha.1+）web 需 token 鉴权——根路径返回 401
+        //   「dsh web authentication required; reopen the URL printed by dsh web.」
+        //   旧标记（deepseek/__dsh_boot__/harness）匹配不了 401 响应，会误判"非 Harness
+        //   服务占用"→ 端口冲突刷屏 + 启动超时失败。'dsh web' 是该响应正文的固有字样。
+        const harness = text.includes('deepseek') || text.includes('__dsh_boot__') || text.includes('harness') || text.includes('dsh web')
         resolve({ healthy: response.statusCode >= 200 && response.statusCode < 500, harness, statusCode: response.statusCode })
       })
     })
@@ -82,6 +86,7 @@ class TerminalSupervisor extends EventEmitter {
     this.probePort = options.probePort || probePort
     this.probeHttp = options.probeHttp || probeHttp
     this.resolvePortPid = options.resolvePortPid || null
+    this.identifyHarness = options.identifyHarness || null // (pid) => Promise<boolean>：按进程 cmdline 识别 DSH
     this.intervalMs = options.intervalMs || 2000
     this.runtimes = new Map()
   }
@@ -177,15 +182,25 @@ class TerminalSupervisor extends EventEmitter {
       const httpStatus = listening ? await this.probeHttp(terminal.port) : { healthy: false, harness: false, statusCode: 0 }
       runtime.portListening = listening
       runtime.httpHealthy = !!httpStatus.healthy
+      // ★ 1.3.1：HTTP 标记识别不了时（新版 DSH 的 token 鉴权 401 页 / 未来其他鉴权页），
+      //   用监听进程 cmdline 兜底识别——node .../bin.js web（或含 dsh/deepseek-harness）必然是 DSH，
+      //   避免把在跑的 DSH 误判成"非 Harness 服务占用"（端口冲突刷屏 / 启动超时失败）。
+      let isHarness = !!httpStatus.harness
+      if (!isHarness && listening && this.identifyHarness && this.resolvePortPid) {
+        try {
+          const pid = await this.resolvePortPid(terminal.port)
+          if (Number.isSafeInteger(pid) && pid > 0) isHarness = await this.identifyHarness(pid)
+        } catch { /* 兜底失败按 HTTP 结果处理 */ }
+      }
       // 曾确认是 Harness 的端口：探测暂时失败时保持 attached（连续失败 3 次才降级为冲突），
       // 避免"端口冲突"误报与状态跳动（源码版 DSH 首页响应慢会偶发超时）
       const wasConfirmed = runtime.harnessConfirmed
-      runtime.harnessConfirmed = !!httpStatus.harness
+      runtime.harnessConfirmed = isHarness
       runtime.lastCheckedAt = Date.now()
 
       if (runtime.stopping) runtime.state = 'stopping'
-      else if (runtime.starting && !httpStatus.harness) runtime.state = listening ? 'checking-http' : 'waiting-port'
-      else if (httpStatus.harness) {
+      else if (runtime.starting && !isHarness) runtime.state = listening ? 'checking-http' : 'waiting-port'
+      else if (isHarness) {
         runtime.httpFailStreak = 0
         // 归属判定：持有 live childProcess 句柄 = 本实例启动；否则若登记了 managedPid，
         // 用监听端口的真实 PID 匹配（重启后识别自己 detach 出去的终端，避免误判为外部接入）。

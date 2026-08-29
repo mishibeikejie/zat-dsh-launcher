@@ -79,6 +79,13 @@ async function findHealthyNpmCli(env, nodeFile, execute = run, onStep = null) {
     const fi = require('./fresh-install')
     return fi.npmCliHealthy(nodeFile, cli)
   }
+  // ★ 先确认 node 可执行：受限环境/测试下 'node' 可能不在 PATH（spawn ENOENT）——
+  //   此时重下 npm CLI 毫无意义（也要 node 跑），直接放弃，避免对多个 registry
+  //   做无谓的重下+体检循环（每源几秒，异常环境拖慢 20 秒）。
+  try {
+    const nodeProbe = await run(nodeFile, ['--version'], null, 6000)
+    if (!nodeProbe.ok) return ''
+  } catch { return '' }
   const candidates = []
   const existing = findNpmCli(env)
   if (existing) candidates.push(existing)
@@ -243,15 +250,28 @@ async function runBuild(dshDir, execute, env, pnpmExe, onStep) {
   const buildEnv = { ...(env || process.env), PATH: [...extraPath, String((env && env.PATH) || process.env.PATH || '')].filter(Boolean).join(';') }
   const runNpm = (script) => npmCli
     ? execute(nodeFile, [npmCli, 'run', script], dshDir, 25 * 60 * 1000, buildEnv)
-    // 无可用 npm-cli（体检全败且重下修复失败）→ 跳过 npm 路径，走 pnpm 直构
+    // 无可用 npm-cli（体检全败且重下修复失败）→ 跳过 npm 路径，走 pnpm
     : Promise.resolve({ ok: false })
+  // pnpm 三段保障（1.0.10）：传入 → 探测 → 自举；null 时 execute(null) 必败（误导"兜底失败"）
+  const resolvePnpm = async () => {
+    if (pnpmExe) return pnpmExe
+    const fi = require('./fresh-install')
+    const found = fi.executablePnpm(fi.findPnpm(), 'node')
+    if (found) return found
+    try { return fi.executablePnpm(await fi.ensurePnpm({ nodeExe: 'node', toolsDir: path.join(os.tmpdir(), 'zat-tools'), onProgress: (d, m) => step(`[${d}] ${m}`) }), 'node') } catch { return null }
+  }
 
-  // 0) npm 完全不可用：直接 pnpm 直构（跳过 npm 包装脚本）
+  // 0) npm 完全不可用：先 pnpm run build（上游 build 脚本可能兼容 pnpm），
+  //    不行再 pnpm 直构真实工作脚本（跳过 npm 包装）。
   if (!npmCli) {
-    step('npm CLI 自检失败且无法修复，改用 pnpm 直接构建…')
-    const direct = await runPnpmDirect(dshDir, execute, pnpmExe, buildEnv, step)
+    step('npm CLI 自检失败且无法修复，改用 pnpm 构建…')
+    const pnpmFallback = await resolvePnpm()
+    const p = await execute(pnpmFallback || null, ['run', 'build'], dshDir, 25 * 60 * 1000, buildEnv)
+    if (p.ok) return { ok: true, used: 'pnpm run build（npm 不可用）' }
+    step('pnpm run build 未通过，改用 pnpm 直构（跳过 npm 包装）…')
+    const direct = await runPnpmDirect(dshDir, execute, pnpmFallback, buildEnv, step)
     if (direct.ok) return direct
-    return { ok: false, err: direct.err }
+    return { ok: false, err: `pnpm 构建失败：${String(p.err || p.out || '').slice(-800)}；${direct.err}` }
   }
 
   // 1) 整体 build
@@ -266,15 +286,7 @@ async function runBuild(dshDir, execute, env, pnpmExe, onStep) {
     const libErr = String(r.err || r.out || '').slice(-1500)
     // 3) 兜底：pnpm run build
     step('build:lib 未通过，最后兜底：pnpm run build')
-    // pnpm 三段保障（1.0.10）：传入 → 探测 → 自举；null 时 execute(null) 必败（误导"兜底失败"）
-    let pnpmFallback = pnpmExe || null
-    if (!pnpmFallback) {
-      const fi = require('./fresh-install')
-      pnpmFallback = fi.executablePnpm(fi.findPnpm(), 'node')
-      if (!pnpmFallback) {
-        try { pnpmFallback = fi.executablePnpm(await fi.ensurePnpm({ nodeExe: 'node', toolsDir: path.join(os.tmpdir(), 'zat-tools') }), 'node') } catch { /* 放弃兜底 */ }
-      }
-    }
+    const pnpmFallback = await resolvePnpm()
     const p = await execute(pnpmFallback || null, ['run', 'build'], dshDir, 25 * 60 * 1000, buildEnv)
     if (p.ok) return { ok: true, used: 'pnpm run build（兜底）' }
     // 3.5) pnpm run build 也失败：跳过包装脚本，直接 pnpm 直构真实工作脚本（最终变通）

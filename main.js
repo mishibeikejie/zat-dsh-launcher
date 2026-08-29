@@ -485,6 +485,8 @@ function initializeTerminalSupervisor() {
     intervalMs: 2000,
     // 重启后识别「自己 detach 出去的终端」：用 netstat 查监听端口真实 PID，匹配登记的 managedPid。
     resolvePortPid: async (port) => { const pids = await listPortPids(port); return pids[0] || null },
+    // ★ 1.3.1：按进程 cmdline 识别 DSH（HTTP 标记识别不到时兜底，见 terminal-supervisor check）
+    identifyHarness: identifyHarnessPid,
   })
   for (const terminal of terminalRegistry.list()) loadTerminalLogHistory(terminal.id)
   for (const terminal of terminalRegistry.list()) {
@@ -1041,6 +1043,22 @@ function listPortPids(port) {
   })
 }
 
+// ★ 1.3.1：按进程 cmdline 识别 DSH（HTTP 标记识别不到时的兜底）。
+// 新版 DSH（0.1.2-alpha.1+）的 web 带 token 鉴权：根路径返回 401「dsh web authentication
+// required」，HTTP 标记（deepseek/__dsh_boot__/harness）匹配不了 → 旧逻辑把在跑的 DSH
+// 误判成"非 Harness 服务占用"（端口冲突刷屏 / 启动 90 秒超时失败）。
+// 识别规则：监听进程 cmdline 含 bin.js ... web（源码/npm/全局形态）或 deepseek-harness。
+const HARNESS_CMDLINE_RE = /(bin\.js[\s"']+web|deepseek[-_]harness|@deepseek-ai[/\\]dsh)/i
+function identifyHarnessPid(pid) {
+  return new Promise(resolve => {
+    if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return resolve(false)
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}").CommandLine`], { windowsHide: true, timeout: 8000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+      if (error || !stdout) return resolve(false)
+      resolve(HARNESS_CMDLINE_RE.test(String(stdout)))
+    })
+  })
+}
+
 function killPid(pid) {
   return new Promise((resolve) => {
     if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return resolve(false)
@@ -1136,6 +1154,12 @@ function openWebPage(url, source, terminalId) {
   }
 }
 
+// ★ 1.3.1：DSH 启动时从 stdout 捕获「dsh web: http://127.0.0.1:<port>/?token=...」
+// 新版 DSH（0.1.2-alpha.1+）web 需 token 鉴权——不带 token 打开会被 401 拒（页面提示
+// "reopen the URL printed by dsh web"）。autoOpen / 「打开网页」按钮都用带 token 的地址。
+const READY_URL_RE = /dsh web:\s*(https?:\/\/\S+)/i
+const readyUrls = new Map() // terminalId -> 带 token 的完整 URL
+
 async function startTerminal(terminalId, startOptions = {}) {
   if (!terminalRegistry || !terminalSupervisor || !terminalRegistry.get(terminalId)) return { ok: false, message: '终端不存在' }
   const p = terminalPaths(terminalId)
@@ -1150,6 +1174,8 @@ async function startTerminal(terminalId, startOptions = {}) {
   // ===== 启动终端 = 重新开始记录（上一个启动周期的实时日志抛弃，UI 面板从本次启动开始） =====
   // ① 清空内存日志（UI 只显示本次启动之后的内容）
   runtime.logs.length = 0
+  // 每次启动重新签发的 token：清掉旧的鉴权地址
+  readyUrls.delete(terminalId)
   // ② 重置该终端的会话游标 + 记录启动时刻：只记本次启动之后发生的事
   const roundHome = resolveHome(p.terminal.dshHome)
   const roundAtNow = Date.now()
@@ -1313,7 +1339,14 @@ async function startTerminal(terminalId, startOptions = {}) {
       pending += chunk.toString()
       const lines = pending.split(/\r?\n/)
       pending = lines.pop() || ''
-      for (const line of lines) if (line.trim()) pushTerminalLog(terminalId, level, line.trim())
+      for (const line of lines) {
+        const text = line.trim()
+        if (!text) continue
+        // 捕获新版 DSH 的 token URL（web 鉴权；不带 token 打开会被 401 拒）
+        const m = text.match(READY_URL_RE)
+        if (m && !readyUrls.get(terminalId)) { readyUrls.set(terminalId, m[1]); pushTerminalLog(terminalId, 'info', `已记录鉴权地址：${m[1].slice(0, 80)}…`) }
+        pushTerminalLog(terminalId, level, text)
+      }
     })
     stream.on('end', () => { if (pending.trim()) pushTerminalLog(terminalId, level, pending.trim()) })
   }
@@ -1449,7 +1482,8 @@ async function startTerminal(terminalId, startOptions = {}) {
     // 就绪必须同时满足：端口是 harness 且本次 spawn 的进程仍存活。
     // check 在 probeInFlight 时返回缓存状态，崩溃循环里可能误报 running——用 childProcess 存活做硬校验。
     if (status.running && status.harnessConfirmed && runtime.childProcess && runtime.childProcess.exitCode === null) {
-      pushTerminalLog(terminalId, 'info', `终端已就绪：${p.webUrl}`)
+      const readyUrl = readyUrls.get(terminalId) || p.webUrl
+      pushTerminalLog(terminalId, 'info', `终端已就绪：${readyUrl}`)
       // 成功启动 = 新的好状态：重置自动恢复阶梯，下次崩溃重新从 L1 走；同时自动刷新救援点
       runtime.autoFixLevel = 0
       runtime.autoRestartCount = 0
@@ -1463,9 +1497,9 @@ async function startTerminal(terminalId, startOptions = {}) {
       if (state.settings.autoOpen && startOptions.autoOpen !== false && noOpen) {
         // 只对「用户主动启动」自动开网页；崩溃自动重启等后台拉起不重复弹网页。
         // noOpen=false（DSH 不支持 --no-open）时 DSH 可能自己开浏览器，跳过 autoOpen 防双开。
-        openWebPage(p.webUrl, 'autoOpen', terminalId)
+        openWebPage(readyUrls.get(terminalId) || p.webUrl, 'autoOpen', terminalId)
       }
-      recordActivity(terminalId, `启动 DSH（端口 ${p.port}）`, p.webUrl)
+      recordActivity(terminalId, `启动 DSH（端口 ${p.port}）`, readyUrls.get(terminalId) || p.webUrl)
       return { ok: true, message: `终端已就绪：${p.webUrl}` }
     }
     await new Promise(resolve => setTimeout(resolve, 500))
@@ -2254,8 +2288,10 @@ function registerIpc() {
     const id = requireTerminalId(terminalId)
     if (!id) return { ok: false, message: '必须指定有效终端' }
     const p = terminalPaths(id)
-    shell.openExternal(p.webUrl)
-    return ok({}, `已打开 ${p.webUrl}`)
+    // ★ 1.3.1：新版 DSH 的 web 需 token 鉴权——优先打开启动时捕获的带 token 地址
+    const url = readyUrls.get(id) || p.webUrl
+    shell.openExternal(url)
+    return ok({}, `已打开 ${url}`)
   })
 
   ipcMain.handle('harness:info', async (_e, terminalId) => {
