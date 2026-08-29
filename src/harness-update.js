@@ -141,6 +141,76 @@ async function runPnpmDirect(dshDir, execute, pnpmExe, env, step) {
   }
 }
 
+// ★ 幽灵工作区目录清理（2026-08-29 实机根因之二）：git 回滚不会删除「合并时新建、回滚后残留」
+// 的未跟踪包目录（实测上次更新从 master 合并出 27 个新包目录，回滚后仅剩 node_modules 空壳）。
+// tsdown 的 workspace glob（packages/*/*、vendor/*、apps/cli）会匹配到这些幽灵目录 →
+// 解析共享入口（lib/types/*）失败 → 整个构建秒败（Cannot find entry: ["lib/types/..."]）。
+// 规则：workspace glob 覆盖的目录中，git 未跟踪、且内容仅剩构建残留（node_modules/lib/dist/
+// .typecheck/tsbuildinfo）的一律删除；含其他文件（用户自己的内容）则保护不动。
+async function cleanUntrackedWorkspaceDirs(dshDir, execute, step) {
+  const RESIDUE = new Set(['node_modules', 'lib', 'dist', '.typecheck'])
+  let removed = 0
+  for (const group of ['packages', 'vendor', 'apps']) {
+    const groupDir = path.join(dshDir, group)
+    let children
+    try { children = fs.readdirSync(groupDir, { withFileTypes: true }) } catch { continue }
+    for (const c of children) {
+      if (!c.isDirectory()) continue
+      // vendor/* 与 packages/*/* 是两级；apps/* 是一级
+      const first = path.join(groupDir, c.name)
+      let candidates = [first]
+      if (group !== 'apps') {
+        let inner
+        try { inner = fs.readdirSync(first, { withFileTypes: true }) } catch { continue }
+        candidates = inner.filter(x => x.isDirectory()).map(x => path.join(first, x.name))
+      }
+      for (const cand of candidates) {
+        const rel = path.relative(dshDir, cand).replace(/\\/g, '/')
+        if (!rel || rel.startsWith('..')) continue
+        // 只处理 git 未跟踪的目录（已跟踪 = 真实包，跳过）
+        try {
+          const tracked = await execute('git', ['ls-files', '--error-unmatch', rel], dshDir, 10000)
+          if (tracked.ok) continue
+        } catch { continue }
+        let entries
+        try { entries = fs.readdirSync(cand, { withFileTypes: true }) } catch { continue }
+        const onlyResidue = entries.every(e => RESIDUE.has(e.name) || e.name.endsWith('.tsbuildinfo'))
+        if (!onlyResidue) continue
+        try {
+          fs.rmSync(cand, { recursive: true, force: true })
+          removed += 1
+          step(`清理幽灵目录（上次更新残留）：${rel}`)
+        } catch { /* 个别失败不阻断 */ }
+      }
+    }
+  }
+  return removed
+}
+
+// ★ 根包工作区入口占位修复（2026-08 实机）：@deepseek-ai/dsh-root 是仓库根元数据包，
+// 没有任何源码，但 tsdown 的 workspace 共享入口 lib/types/{index,invariant,startup}.js
+// 会在构建开始前解析【每一个】工作区包（含根包）的入口——根包无此产物时全构建秒败
+// （Cannot find entry: ["lib/types/{index,invariant,startup}.js"]，实测 rc.2 与 master 均如此）。
+// 该产物是旧版布局的历史遗留（8/21 构建时尚在，之后缺失），上游无命令可重新生成。
+// 用惰性 ESM 占位补位：根包无运行时消费方（npm 发布也明确排除 dsh-root），export {} 完全惰性。
+function ensureRootTypeStubs(dshDir, step) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dshDir, 'package.json'), 'utf8'))
+    if (pkg.name !== '@deepseek-ai/dsh-root') return
+    if (fs.existsSync(path.join(dshDir, 'src'))) return // 有源码的项目不需要占位
+    const dir = path.join(dshDir, 'lib', 'types')
+    let created = 0
+    for (const name of ['index.js', 'invariant.js', 'startup.js']) {
+      const f = path.join(dir, name)
+      if (fs.existsSync(f)) continue
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(f, '// ZAT-DSH Launcher 占位：@deepseek-ai/dsh-root（仓库根元数据包）无源码，\n// tsdown 工作区入口需要此文件存在；惰性 ESM，无运行时消费方。\nexport {}\n', 'utf8')
+      created += 1
+    }
+    if (created) step(`根包工作区入口缺失（lib/types/*），已生成 ${created} 个惰性占位模块`)
+  } catch { /* 非根包或不可读：跳过 */ }
+}
+
 // 构建：多级自适应。返回 { ok }，失败带完整错误尾部。
 // 兼容矩阵：
 //  - 旧版 build script（npm run build:lib && npm run build:web）与新版（tsx scripts/build.ts）
@@ -153,6 +223,11 @@ async function runPnpmDirect(dshDir, execute, pnpmExe, env, step) {
 async function runBuild(dshDir, execute, env, pnpmExe, onStep) {
   const nodeFile = process.env.npm_node_execpath || 'node'
   const step = (msg) => { try { if (onStep) onStep(msg) } catch { /* 日志失败不阻断 */ } }
+  // ★ 幽灵工作区目录清理（见 cleanUntrackedWorkspaceDirs 注释）：上次更新残留的
+  //   未跟踪包目录会直接让 tsdown 全建秒败——构建前先清。
+  await cleanUntrackedWorkspaceDirs(dshDir, execute, step)
+  // ★ 上游根包工作区入口缺失的自动补位（见 ensureRootTypeStubs 注释）
+  ensureRootTypeStubs(dshDir, step)
   // ★ 体检后选 npm-cli（1.2.3 修复）：坏缓存（解压残留/杀软删文件）会让 npm 存在但任何
   //   `npm run` 都瞬间崩（2026-08 实机：更新构建全链失败）。坏则触发自举重下修复。
   const npmCli = await findHealthyNpmCli(env, nodeFile, execute, step)
@@ -357,7 +432,7 @@ async function checkUpdate(dshDir, execute = run, probeLatest = null) {
       behindCount: newer ? 1 : 0,
       updateAvailable: newer,
       canInstall: newer,
-      message: newer ? `发现新版本 ${remoteVersion}（当前 ${local.version}）` : '当前已是最新版本',
+      message: newer ? `发现新版本 ${remoteVersion}（当前 ${local.version}）` : `当前已是最新版本（${local.version}）`,
     }
   }
   const remoteRef = `refs/remotes/zat-update/${local.branch}`
@@ -387,7 +462,7 @@ async function checkUpdate(dshDir, execute = run, probeLatest = null) {
     updateAvailable: behindCount > 0,
     // 有本地修改也能安装：安装时会自动 stash 暂存备份，更新完成后恢复（见 installUpdate）
     canInstall: behindCount > 0,
-    message: behindCount > 0 ? `发现 ${behindCount} 个新提交` : '当前已是最新版本',
+    message: behindCount > 0 ? `发现 ${behindCount} 个新提交（远端 ${remoteVersion}）` : `当前已是最新版本（${local.version}，HEAD ${local.commit}）`,
   }
 }
 
@@ -466,6 +541,8 @@ async function restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm
   }
   steps.push('代码已回滚')
   clearTsBuildInfo(dshDir)
+  // ★ 回滚后清理幽灵工作区目录（更新合并时新建、回滚后残留的未跟踪包目录）
+  await cleanUntrackedWorkspaceDirs(dshDir, execute, () => {})
   let restoreInstall = { ok: false }
   for (const args of installAttempts) {
     restoreInstall = await execute(pnpm, args, dshDir, 15 * 60 * 1000)
@@ -571,4 +648,4 @@ async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
   return { ...(await localInfo(dshDir, execute)), updateAvailable: false, message: 'Harness 已更新到官方版本' }
 }
 
-module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli, findHealthyNpmCli, runPnpmDirect }
+module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli, findHealthyNpmCli, runPnpmDirect, cleanUntrackedWorkspaceDirs }

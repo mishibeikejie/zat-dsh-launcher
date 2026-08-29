@@ -123,3 +123,32 @@ test('npmLatestProbe uses node fetch and returns registry version', async () => 
   assert.ok(typeof version === 'string')
   assert.ok(version.length > 0 || version === '')
 })
+
+test('cleanUntrackedWorkspaceDirs removes ghost dirs but keeps tracked and user files', async () => {
+  const { cleanUntrackedWorkspaceDirs } = require('../src/harness-update')
+  const dir = tmpDir('ghost')
+  try {
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-root', version: '0.1.0-rc.8' }))
+    // 真实包（已跟踪）：保留
+    fs.mkdirSync(path.join(dir, 'packages', 'util', 'brand'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'packages', 'util', 'brand', 'package.json'), '{}')
+    // 幽灵目录（未跟踪，仅 node_modules 残留）：删除
+    fs.mkdirSync(path.join(dir, 'packages', 'api', 'session-controller', 'node_modules', 'x'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'packages', 'api', 'session-controller', 'node_modules', 'x', 'package.json'), '{}')
+    // 未跟踪但含用户文件：保护不动
+    fs.mkdirSync(path.join(dir, 'packages', 'api', 'user-stuff', 'node_modules'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'packages', 'api', 'user-stuff', 'notes.txt'), 'keep me')
+    const trackedSet = new Set(['packages/util/brand'])
+    const execute = async (_file, args) => {
+      // 模拟 git ls-files --error-unmatch <rel>
+      const rel = args[args.length - 1]
+      return trackedSet.has(rel) ? { ok: true } : { ok: false }
+    }
+    const steps = []
+    const removed = await cleanUntrackedWorkspaceDirs(dir, execute, msg => steps.push(msg))
+    assert.equal(removed, 1)
+    assert.equal(fs.existsSync(path.join(dir, 'packages', 'api', 'session-controller')), false)
+    assert.equal(fs.existsSync(path.join(dir, 'packages', 'util', 'brand')), true)
+    assert.equal(fs.existsSync(path.join(dir, 'packages', 'api', 'user-stuff', 'notes.txt')), true)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})

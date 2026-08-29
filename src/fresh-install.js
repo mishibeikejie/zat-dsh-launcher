@@ -510,7 +510,19 @@ async function ensureGit({ toolsDir, onProgress, execute = run }) {
     const dir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
     const gitDir = path.join(dir, 'git')
     const gitExe = path.join(gitDir, 'cmd', 'git.exe')
-    if (fs.existsSync(gitExe)) return gitExe
+    // ★ 体检后复用（同 npmCliHealthy 的教训）：git.exe 存在但解压不全/DLL 丢失时，
+    //   任何 git 调用都崩——更新检查会假报"网络暂不可用"（静默掩蔽故障类）。
+    const probeGit = async (exe) => {
+      try {
+        const r = await run(exe, ['--version'], null, 6000)
+        return r.ok && /git version/i.test(r.out) ? true : false
+      } catch { return false }
+    }
+    if (fs.existsSync(gitExe) && await probeGit(gitExe)) return gitExe
+    if (fs.existsSync(gitExe)) {
+      if (onProgress) onProgress('git', '缓存 PortableGit 自检失败，重新自举…')
+      try { fs.rmSync(gitDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
+    }
     const system = findSystemGit()
     if (system) return system
     fs.mkdirSync(dir, { recursive: true })
@@ -524,11 +536,11 @@ async function ensureGit({ toolsDir, onProgress, execute = run }) {
       if (onProgress) onProgress('git', '解压 PortableGit（自解压，约 1-2 分钟）…')
       const ex = await run(pkg, ['-y', '-gm2', `-o"${gitDir}"`], dir, 10 * 60 * 1000)
       fs.rmSync(pkg, { force: true })
-      if (ex.ok && fs.existsSync(gitExe)) {
+      if (ex.ok && fs.existsSync(gitExe) && await probeGit(gitExe)) {
         if (onProgress) onProgress('git', `PortableGit 就绪：${gitExe}`)
         return gitExe
       }
-      lastErr = `解压失败或缺少 cmd/git.exe（${(ex.err || '').slice(0, 120)}）`
+      lastErr = `解压后自检失败（${(ex.err || '').slice(0, 120)}）`
       fs.rmSync(gitDir, { recursive: true, force: true })
     }
     if (onProgress) onProgress('git', `PortableGit 自举失败：${lastErr || '未知错误'}`)
