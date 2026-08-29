@@ -1,5 +1,5 @@
 {
-  "version": "1.2.2",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.2.2/ZAT-DSH-Launcher-Setup-1.2.2.exe",
-  "notes": "v1.2.2 修复：一键扫描补上 dsh 命令、npm/pnpm 全局安装、DSH_HOME 识别；手动接入不再要求用户选中的目录本身就是根目录，会在所选目录内自动递归查找 DSH；兼容官方 npx @deepseek-ai/dsh web 的无项目根安装方式。"
+  "version": "1.3.0",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.3.0/ZAT-DSH-Launcher-Setup-1.3.0.exe",
+  "notes": "v1.3.0 修复：更新构建全链三连修复——自举 npm 体检自愈（坏缓存自动重下，修复 npm run 秒崩）；更新回滚残留幽灵包目录自动清理（git reset 不删未跟踪目录，残留空壳导致 tsdown 全建秒败）；git 体检自愈；回滚结果核验；npm 不可用时 pnpm 直构兜底；下载/安装 EPERM 杀软锁文件自动重试；版本提示带具体版本号。"
 }

@@ -25,7 +25,7 @@ const { planTerminalDeletion } = require('./src/terminal-files')
 const toolchainExec = require('./src/toolchain-execute')
 const cliProbe = require('./src/cli-probe')
 
-const APP_VERSION = '1.2.2'
+const APP_VERSION = '1.3.0'
 
 // ---------------------------------------------------------------------------
 // 白板/交付版隔离：打包版使用按版本隔离的数据目录（%APPDATA%\ZAT-Launcher\v<版本>），
