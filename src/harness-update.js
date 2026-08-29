@@ -33,6 +33,7 @@ function run(file, args, cwd, timeout = 120000) {
 }
 
 // 探测 npm-cli.js（纯 JS 的 npm 入口）：工具链 PATH 目录 → %TEMP%\zat-tools 自举 → 系统 node 目录
+// （纯路径探测，不带健康检查；健康校验见 findHealthyNpmCli —— runBuild 用它）
 function findNpmCli(env) {
   const candidates = []
   const pathValue = String((env && env.PATH) || process.env.PATH || '')
@@ -69,6 +70,77 @@ function findNpmCli(env) {
   return ''
 }
 
+// ★ 健康 npm CLI 探测（2026-08 实机根因）：坏缓存（解压残留/杀软删文件）会让候选 npm 存在但
+// 任何 `npm run` 都瞬间崩，导致 DSH 更新构建全链失败。逐个候选体检（node <cli> --version），
+// 第一个能用的返回；全坏则尝试自举重下修复；仍无返回 ''（调用方走 pnpm 直构兜底）。
+async function findHealthyNpmCli(env, nodeFile, execute = run, onStep = null) {
+  const tryProbe = async (cli) => {
+    if (!cli) return false
+    const fi = require('./fresh-install')
+    return fi.npmCliHealthy(nodeFile, cli)
+  }
+  const candidates = []
+  const existing = findNpmCli(env)
+  if (existing) candidates.push(existing)
+  // 追加兜底候选：fresh fast-check 之前已知形态（结构兼容）
+  candidates.push(path.join(os.tmpdir(), 'zat-tools', 'package', 'bin', 'npm-cli.js'))
+  for (const c of candidates) {
+    if (await tryProbe(c)) return c
+  }
+  // 全坏：重新自举（ensureNpmCli 内部也会体检）
+  try {
+    const fi = require('./fresh-install')
+    const step = onStep || (() => {})
+    step('npm CLI 自检异常，正在重新下载修复…')
+    const cli = await fi.ensureNpmCli({
+      nodeExe: nodeFile,
+      toolsDir: path.join(os.tmpdir(), 'zat-tools'),
+      onProgress: (d, m) => step(`[${d}] ${m}`),
+    })
+    if (cli && (await fi.npmCliHealthy(nodeFile, cli))) return cli
+  } catch { /* 修复失败 → 返回 '' 走 pnpm 兜底 */ }
+  return ''
+}
+
+// ★ pnpm 直构兜底（npm 完全不可用时）：DSH 的 build:lib 包装脚本用 npm 串联，
+// 但真实工作脚本（build:lib:host / build:lib:client / build:web）本身不依赖 npm——
+// 跳过包装直接用 pnpm 跑这些脚本即可完成构建（实测 rc.2 与 master 均适用）。
+async function runPnpmDirect(dshDir, execute, pnpmExe, env, step) {
+  const fail = (why) => ({ ok: false, err: why })
+  // pnpm 三段保障（与 runBuild 兜底一致）：传入 → 探测 → 自举
+  let pnpm = pnpmExe || null
+  if (!pnpm) {
+    const fi = require('./fresh-install')
+    pnpm = fi.executablePnpm(fi.findPnpm(), 'node')
+    if (!pnpm) {
+      try { pnpm = fi.executablePnpm(await fi.ensurePnpm({ nodeExe: 'node', toolsDir: path.join(os.tmpdir(), 'zat-tools'), onProgress: (d, m) => step(`[${d}] ${m}`) }), 'node') } catch { pnpm = null }
+    }
+  }
+  if (!pnpm) return fail('pnpm 不可用（探测与自举均失败），无法直构')
+  const runScript = (name) => execute(pnpm, ['run', name], dshDir, 25 * 60 * 1000, env)
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dshDir, 'package.json'), 'utf8'))
+    const scripts = pkg.scripts || {}
+    const libParts = ['build:lib:host', 'build:lib:client']
+    for (const s of libParts) {
+      if (!scripts[s]) return fail(`缺少脚本 ${s}，无法 pnpm 直构`)
+      step(`pnpm 直构：${s}`)
+      const r = await runScript(s)
+      if (!r.ok) return fail(`pnpm 直构 ${s} 失败：${String(r.err || r.out || '').slice(-800)}`)
+    }
+    if (scripts['build:web']) {
+      step('pnpm 直构：build:web（上游可能引用不存在的 filter 包，可容忍跳过）')
+      const r = await runScript('build:web')
+      if (!r.ok && !/No projects matched the filters/i.test(String(r.err || r.out || ''))) {
+        return fail(`pnpm 直构 build:web 失败：${String(r.err || r.out || '').slice(-800)}`)
+      }
+    }
+    return { ok: true, used: 'pnpm 直构（npm 不可用变通）' }
+  } catch (e) {
+    return fail(`pnpm 直构失败：${e && e.message || e}`)
+  }
+}
+
 // 构建：多级自适应。返回 { ok }，失败带完整错误尾部。
 // 兼容矩阵：
 //  - 旧版 build script（npm run build:lib && npm run build:web）与新版（tsx scripts/build.ts）
@@ -79,9 +151,11 @@ function findNpmCli(env) {
 //    失败且错误为「No projects matched the filters」时智能跳过，其余失败照常报错
 //  - pnpm run build 作为最后兜底（兼容未来上游修正后 pnpm 也可用的场景）
 async function runBuild(dshDir, execute, env, pnpmExe, onStep) {
-  const npmCli = findNpmCli(env)
   const nodeFile = process.env.npm_node_execpath || 'node'
   const step = (msg) => { try { if (onStep) onStep(msg) } catch { /* 日志失败不阻断 */ } }
+  // ★ 体检后选 npm-cli（1.2.3 修复）：坏缓存（解压残留/杀软删文件）会让 npm 存在但任何
+  //   `npm run` 都瞬间崩（2026-08 实机：更新构建全链失败）。坏则触发自举重下修复。
+  const npmCli = await findHealthyNpmCli(env, nodeFile, execute, step)
   // build:web 的 script 是 `pnpm --filter ... run build`，npm 执行 script 时必须在 PATH 里
   // 能找到 pnpm——把 pnpm 所在目录显式前置进构建环境（工具链 PATH 缺 pnpm 时也能构建）。
   const extraPath = []
@@ -94,8 +168,16 @@ async function runBuild(dshDir, execute, env, pnpmExe, onStep) {
   const buildEnv = { ...(env || process.env), PATH: [...extraPath, String((env && env.PATH) || process.env.PATH || '')].filter(Boolean).join(';') }
   const runNpm = (script) => npmCli
     ? execute(nodeFile, [npmCli, 'run', script], dshDir, 25 * 60 * 1000, buildEnv)
-    // 无自举 npm-cli 时让系统 PATH 解析 npm（'npm.cmd' 字面量在 Node 24 无 shell 会 EINVAL）
-    : execute('npm', ['run', script], dshDir, 25 * 60 * 1000, buildEnv)
+    // 无可用 npm-cli（体检全败且重下修复失败）→ 跳过 npm 路径，走 pnpm 直构
+    : Promise.resolve({ ok: false })
+
+  // 0) npm 完全不可用：直接 pnpm 直构（跳过 npm 包装脚本）
+  if (!npmCli) {
+    step('npm CLI 自检失败且无法修复，改用 pnpm 直接构建…')
+    const direct = await runPnpmDirect(dshDir, execute, pnpmExe, buildEnv, step)
+    if (direct.ok) return direct
+    return { ok: false, err: direct.err }
+  }
 
   // 1) 整体 build
   step('构建中：npm run build（全量编译，约需 2~5 分钟，请耐心等待）')
@@ -120,7 +202,11 @@ async function runBuild(dshDir, execute, env, pnpmExe, onStep) {
     }
     const p = await execute(pnpmFallback || null, ['run', 'build'], dshDir, 25 * 60 * 1000, buildEnv)
     if (p.ok) return { ok: true, used: 'pnpm run build（兜底）' }
-    return { ok: false, err: `build:lib 失败：${libErr}；pnpm 兜底也失败：${String(p.err || p.out || '').slice(-800)}` }
+    // 3.5) pnpm run build 也失败：跳过包装脚本，直接 pnpm 直构真实工作脚本（最终变通）
+    step('pnpm run build 未通过，改用 pnpm 直构（跳过 npm 包装）…')
+    const direct = await runPnpmDirect(dshDir, execute, pnpmFallback, buildEnv, step)
+    if (direct.ok) return direct
+    return { ok: false, err: `build:lib 失败：${libErr}；pnpm 兜底也失败：${String(p.err || p.out || '').slice(-800)}；${direct.err}` }
   }
 
   // 4) build:web：识别上游失效脚本（filter 包不存在），智能跳过
@@ -370,7 +456,14 @@ function verifyKeyArtifacts(dshDir) {
 // 恢复旧版本到可运行状态：回滚代码 + 清增量缓存 + 重装依赖 + 重建旧代码产物
 async function restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm) {
   const steps = []
-  await execute('git', ['reset', '--hard', oldHead], dshDir, 120000)
+  // ★ 结果必须核验（1.2.3 修复）：旧实现 push('代码已回滚') 不看 reset 结果与 HEAD，
+  //   真实回滚失败时仍谎称"已回滚"（实测 0.1.1-rc.2 树回滚失败但提示"代码已回滚"）。
+  const reset = await execute('git', ['reset', '--hard', oldHead], dshDir, 120000)
+  if (!reset.ok) return { ok: false, err: `代码回滚失败：${String(reset.err || reset.out || '').slice(-300)}` }
+  const headAfter = await execute('git', ['rev-parse', 'HEAD'], dshDir)
+  if (!headAfter.ok || String(headAfter.out).trim() !== String(oldHead).trim()) {
+    return { ok: false, err: `代码回滚未生效（HEAD=${String(headAfter.out || '').trim()}，期望 ${String(oldHead).trim()}）` }
+  }
   steps.push('代码已回滚')
   clearTsBuildInfo(dshDir)
   let restoreInstall = { ok: false }
@@ -478,4 +571,4 @@ async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
   return { ...(await localInfo(dshDir, execute)), updateAvailable: false, message: 'Harness 已更新到官方版本' }
 }
 
-module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli }
+module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli, findHealthyNpmCli, runPnpmDirect }

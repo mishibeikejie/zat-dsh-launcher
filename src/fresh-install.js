@@ -213,23 +213,79 @@ function downloadFileNative(url, dest, onProgress, timeoutMs = 60000, redirects 
       const total = Number(response.headers['content-length'] || 0)
       let received = 0
       const tmp = `${dest}.part`
-      fs.rmSync(tmp, { force: true })
-      const out = fs.createWriteStream(tmp)
-      response.on('data', chunk => {
-        received += chunk.length
-        out.write(chunk)
-        if (total && onProgress) onProgress('依赖', `下载中 ${Math.round(received / total * 100)}%`)
+      try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略：残留文件可能被占用，用带重试的打开覆盖 */ }
+      // ★ 杀软扫描/占用导致的 EPERM 重试：国内用户机器常见（createWriteStream 报
+      //   EPERM: operation not permitted, open '<path>'——朋友实机截图根因）。
+      const openStream = () => new Promise((res, rej) => {
+        let attempt = 0
+        const tryOpen = () => {
+          try { res(fs.createWriteStream(tmp, { flags: 'w' })) } catch (err) {
+            attempt += 1
+            if (attempt >= 4) return rej(err)
+            setTimeout(tryOpen, 500 * attempt)
+          }
+        }
+        tryOpen()
       })
-      response.on('end', () => {
-        out.end(() => {
-          try { fs.renameSync(tmp, dest); resolve({ ok: true }) } catch (err) { fs.rmSync(tmp, { force: true }); resolve({ ok: false, err: err.message }) }
+      const startPump = (out) => {
+        response.on('data', chunk => {
+          received += chunk.length
+          out.write(chunk)
+          if (total && onProgress) onProgress('依赖', `下载中 ${Math.round(received / total * 100)}%`)
         })
-      })
-      response.on('error', err => { fs.rmSync(tmp, { force: true }); resolve({ ok: false, err: err.message }) })
+        response.on('end', () => {
+          out.end(() => {
+            const finish = () => {
+              withRetry(() => new Promise((res, rej) => fs.rename(tmp, dest, e => (e ? rej(e) : res()))), 4, 500)
+                .then(() => resolve({ ok: true }))
+                .catch((err) => { try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ } resolve({ ok: false, err: err.message }) })
+            }
+            finish()
+          })
+        })
+        response.on('error', err => { try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ } resolve({ ok: false, err: err.message }) })
+      }
+      openStream()
+        .then(startPump)
+        .catch((err) => {
+          response.resume()
+          resolve({ ok: false, err: `写入临时文件失败：${err.message}` })
+        })
     })
     request.setTimeout(timeoutMs, () => { request.destroy(); resolve({ ok: false, err: '下载超时' }) })
     request.on('error', err => resolve({ ok: false, err: err.message }))
   })
+}
+
+// 简单重试（杀软扫描/临时占用导致的 EPERM/EBUSY 常见，重试通常即通过）
+async function withRetry(fn, times = 3, delayMs = 400, retryable = () => true) {
+  let lastErr = null
+  for (let i = 0; i < times; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      if (!retryable(err) || i === times - 1) throw err
+      await new Promise(res => setTimeout(res, delayMs * (i + 1)))
+    }
+  }
+  throw lastErr
+}
+
+// ★ npm CLI 健康检查（2026-08 实测根因）：自举解压的 npm 包可能残留损坏——
+// 曾出现 node_modules/node-gyp/bin/node-gyp.js 与 lib/commands/* 缺失（解压残留/杀软删除），
+// 任何 `npm run ...` 都瞬间崩 MODULE_NOT_FOUND（exit 1），导致 DSH 更新构建全链失败。
+// 体检标准：node <cli> --version 8 秒内成功输出 11.x，且 node_modules 与入口存在。
+async function npmCliHealthy(nodeExe, cliPath) {
+  try {
+    if (!cliPath || !fs.existsSync(cliPath)) return false
+    const r = await run(nodeExe, [cliPath, '--version'], null, 8000)
+    if (!r.ok) return false
+    if (!/^\s*\d+\.\d+\.\d+/.test(r.out)) return false
+    const pkgRoot = path.dirname(path.dirname(cliPath))
+    if (!fs.existsSync(path.join(pkgRoot, 'node_modules'))) return false
+    return true
+  } catch { return false }
 }
 
 // 下载 tgz 并解压 package/bin 下的 CLI 入口（pnpm.cjs 或 npm-cli.js），返回入口路径。
@@ -315,13 +371,23 @@ async function pickRegistry(nodeExe, execute = run) {
 
 // npm 包级工具自举：下载 npm-cli 到 toolsDir（npm registry 官方/国内镜像，3 秒超时切换）。
 // 用 11.x：npm 10.9.2 的 arborist 解析 @deepseek-ai/dsh 依赖树会崩溃（Link.matches null，npm 已知 bug）。
+// ★ 缓存必须先体检再复用（npmCliHealthy）：解压残留/杀软删文件的坏缓存直接弃用重下，
+//   否则任何 npm 调用瞬间崩（2026-08 实机：更新构建全链失败）。
 async function ensureNpmCli({ nodeExe, toolsDir, onProgress, execute = runWithProgress }) {
   const version = '11.3.0'
   const dir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
-  // npm-cli.js 保留在解压目录内（依赖同包 lib），先探测已解压的（两种命名都认）
+  // 缓存命中：兼容两种结构（tar 解压 package-<v>/package/bin 与 直接 package-<v>/bin），逐一体检
   for (const sub of [`package-${version}`, 'package']) {
-    const candidate = path.join(dir, sub, 'package', 'bin', 'npm-cli.js')
-    if (fs.existsSync(candidate)) return candidate
+    for (const inner of ['package', '']) {
+      const candidate = path.join(dir, sub, inner, 'bin', 'npm-cli.js')
+      if (!fs.existsSync(candidate)) continue
+      const healthy = await npmCliHealthy(nodeExe, candidate)
+      if (healthy) return candidate
+      // 坏缓存：移除，走重新下载修复
+      if (onProgress) onProgress('依赖', `npm CLI 自检失败（${sub}），正在重新下载修复…`)
+      try { fs.rmSync(path.join(dir, sub), { recursive: true, force: true }) } catch { /* 移除失败交给下载流程覆盖 */ }
+      break
+    }
   }
   fs.mkdirSync(dir, { recursive: true })
   let lastUrl = ''
@@ -330,7 +396,8 @@ async function ensureNpmCli({ nodeExe, toolsDir, onProgress, execute = runWithPr
     lastUrl = `${base}/npm/-/npm-${version}.tgz`
     if (onProgress) onProgress('依赖', `下载 npm CLI（${i + 1}/${NPM_REGISTRIES.length}）…`)
     const entry = await downloadCliTgz(lastUrl, dir, version, onProgress)
-    if (entry && entry.endsWith('npm-cli.js')) return entry
+    if (entry && (await npmCliHealthy(nodeExe, entry))) return entry
+    if (entry && onProgress) onProgress('依赖', 'npm CLI 下载后自检失败，切换下一源…')
   }
   if (onProgress) onProgress('依赖', `npm CLI 自举失败：${lastUrl}`)
   throw new Error('无法自举 npm CLI（registry 均不可用）')
@@ -338,12 +405,18 @@ async function ensureNpmCli({ nodeExe, toolsDir, onProgress, execute = runWithPr
 
 // 确保 toolsDir 里有可执行的 npm.cmd（DSH build 脚本直接调 `npm run ...`）。
 // 本机往往没有全局 npm，这里用自举的 npm-cli.js 生成一个 npm.cmd 包装（幂等）。
+// ★ 幂等校验：已有 npm.cmd 必须体检其引用的 npm-cli；坏引用（残留/路径失效）重新生成。
 // 返回 npm.cmd 路径；失败返回 ''（调用方决定是否降级）。
 async function ensureNpmCommand({ nodeExe, toolsDir, onProgress, execute = runWithProgress }) {
   try {
     const dir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
     const npmCmd = path.join(dir, 'npm.cmd')
-    if (fs.existsSync(npmCmd)) return npmCmd
+    if (fs.existsSync(npmCmd)) {
+      // 体检 npm.cmd 引用的 npm-cli 是否真能用（引用路径可能因重新解压/结构变化而失效）
+      const m = fs.readFileSync(npmCmd, 'utf8').match(/"([^"]+npm-cli\.js)"/)
+      if (m && (await npmCliHealthy(nodeExe, m[1]))) return npmCmd
+      try { fs.rmSync(npmCmd, { force: true }) } catch { /* 忽略 */ }
+    }
     const cli = await ensureNpmCli({ nodeExe, toolsDir: dir, onProgress, execute })
     if (!cli || !fs.existsSync(cli)) return ''
     const nodePath = String(nodeExe || 'node').replace(/"/g, '')
@@ -951,13 +1024,20 @@ async function installOfficialPackage({ nodeExe, toolsDir, targetDir, onProgress
     //   的文件永远删不掉（0.6.29 删除残留根因，nlink=8 实测证实）。
     //   copy 模式让每个终端完全独立拷贝：删除/更新互不影响，真正"终端 100% 独立"。
     const r = await execute('下载', pnpmExeResolved, ['add', spec, '--dir', targetDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 10 * 60 * 1000, envForCli)
+    // ★ EPERM/EBUSY 重试（杀软扫描/文件占用瞬时锁，重试通常通过——朋友实机全新安装失败根因）
+    let rFinal = r
+    if (!r.ok && /EPERM|EBUSY|EACCES/i.test(String(r.err || '') + String(r.out || ''))) {
+      if (onProgress) onProgress('下载', '文件被占用（EPERM/EBUSY，常见于杀软扫描），等待后重试一次…')
+      await new Promise(res => setTimeout(res, 1500))
+      rFinal = await execute('下载', pnpmExeResolved, ['add', spec, '--dir', targetDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 10 * 60 * 1000, envForCli)
+    }
     // 以 bin.js 就位为准：pnpm 可能因原生构建脚本被忽略而返回非 0（ERR_PNPM_IGNORED_BUILDS），
     // 但预构建包本体已安装成功。缺失的原生模块由 DSH 首次启动时按需处理。
     if (fs.existsSync(path.join(dshDir, 'lib', 'bin.js'))) {
       if (onProgress) onProgress('下载', '官方 DSH 下载完成（预构建，直接可用）')
       return { ok: true, dshDir }
     }
-    const detail = (r.err || r.out || '').trim().split(/\r?\n/).slice(-3).join(' | ')
+    const detail = (rFinal.err || rFinal.out || '').trim().split(/\r?\n/).slice(-3).join(' | ')
     return { ok: false, message: `pnpm 安装失败：${detail || '无输出'}` }
   }
   // pnpm 自举失败：明确报错，绝不回退 npm（npm 对 dsh 依赖树解析性能崩塌，实测 7.5 分钟死转，
@@ -995,7 +1075,13 @@ async function updateNpmPackage({ nodeExe, targetDir, toolsDir, onProgress, exec
   // pnpm 11 默认忽略依赖构建脚本并返回非 0（ERR_PNPM_IGNORED_BUILDS）——
   // 必须显式允许，否则原生模块（如 subprocess-local）缺失且更新被误判失败。
   // 宽容兜底：即使返回非 0，只要目标版本已就位就算成功（ignored-builds 场景包已装上）。
-  const r = await execute('更新', pnpm, ['add', spec, '--dir', targetDir, '--registry', registry, '--config.package-import-method=copy', '--config.dangerously-allow-all-builds=true'], undefined, onProgress, 10 * 60 * 1000, envForCli)
+  const addArgs = ['add', spec, '--dir', targetDir, '--registry', registry, '--config.package-import-method=copy', '--config.dangerously-allow-all-builds=true']
+  let r = await execute('更新', pnpm, addArgs, undefined, onProgress, 10 * 60 * 1000, envForCli)
+  if (!r.ok && /EPERM|EBUSY|EACCES/i.test(String(r.err || '') + String(r.out || ''))) {
+    if (onProgress) onProgress('更新', '文件被占用（EPERM/EBUSY，常见于杀软扫描），等待后重试一次…')
+    await new Promise(res => setTimeout(res, 1500))
+    r = await execute('更新', pnpm, addArgs, undefined, onProgress, 10 * 60 * 1000, envForCli)
+  }
   if (!r.ok) {
     const detail = (r.err || r.out || '').trim().split(/\r?\n/).slice(-3).join(' | ')
     // 已就位判定：目标版本出现在输出里（pnpm 会打印 "+ @deepseek-ai/dsh <version>"）
@@ -1022,5 +1108,6 @@ module.exports = {
   GIT_MIRRORS,
   executablePnpmOrRaw,
   resolveLatestDshVersion,
+  npmCliHealthy, withRetry,
   DSH_ORIGIN, DSH_NPM_PACKAGE, DSH_NPM_TAG, NPM_REGISTRIES, SOURCE_TIMEOUT_MS,
 }
