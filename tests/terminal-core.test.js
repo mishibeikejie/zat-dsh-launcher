@@ -267,6 +267,31 @@ test('supervisor reports a non-Harness HTTP listener as a port conflict', async 
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
+// ★ 1.3.1 回归：新版 DSH web token 鉴权（根路径 401「dsh web authentication required...」）
+// 应识别为 Harness（attached-running），而不是误判"非 Harness 服务占用"（端口冲突）。
+test('supervisor identifies DSH token-auth 401 page as harness (1.3.1 regression)', async () => {
+  const { dir, registry } = temporaryRegistry()
+  const http = require('node:http')
+  let server
+  const port = 31377
+  try {
+    const terminal = registry.add({ port, dshDir: 'D:\\dsh-a' })
+    server = http.createServer((_req, res) => {
+      res.writeHead(401, { 'Content-Type': 'text/plain' })
+      res.end('dsh web authentication required; reopen the URL printed by dsh web.')
+    })
+    await new Promise(resolve => server.listen(port, '127.0.0.1', resolve))
+    const supervisor = new TerminalSupervisor({ registry, intervalMs: 1e9 })
+    await supervisor.check(terminal.id)
+    assert.equal(supervisor.get(terminal.id).state, 'attached-running')
+    assert.equal(supervisor.get(terminal.id).harnessConfirmed, true)
+    supervisor.dispose()
+  } finally {
+    if (server) await new Promise(resolve => server.close(resolve))
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('supervisor tracks two terminals independently and recognizes attached harness', async () => {
   const { dir, registry } = temporaryRegistry()
   try {
