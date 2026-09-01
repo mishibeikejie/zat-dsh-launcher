@@ -32,6 +32,11 @@ function classifyNpmMode(root, originalDir) {
   const lowerRoot = root.toLowerCase()
   // npx 缓存特征：路径含 \_npx\ 或 /_npx/
   if (lowerRoot.includes('\\_npx\\') || lowerRoot.includes('/_npx/')) return 'npx'
+  // ★ pnpm 全局/dlx 布局（1.4.0）：归一化根落在 pnpm 的 global\<n> / dlx\<hash> 内部——
+  //   pnpm 会往里写 package.json（虚拟项目），旧逻辑误判为 'npm' 项目根形态 →
+  //   dshHome 指到 pnpm 内部目录，Profile/引擎/会话检测全部落空（"扫到了但接坏"）。
+  //   一律按 standalone 处理（dshHome = ~/.dsh）。
+  if (/[\\\/]pnpm[\\\/](global|dlx)[\\\/]/i.test(root)) return 'npm-standalone'
   // 从包根（node_modules/@deepseek-ai/dsh）归一化到项目根：检查项目根是否有 package.json。
   // 没有则说明是全局安装的包管理前缀（如 %APPDATA%\npm），不是项目根。
   if (originalDir && normalizeNpmRoot(originalDir) !== originalDir) {
@@ -111,6 +116,16 @@ function isDshHomeDir(value) {
   return fs.existsSync(path.join(profilesDir, 'node_modules', '@deepseek-ai', 'dsh-base'))
 }
 
+// ★ 控制台输出解码（1.4.0）：中文系统 where.exe/cmd 的 stdout 是 OEM 代码页（cp936），
+//   按 UTF-8 解码中文路径变乱码 → existsSync 失败 → 全局安装识别失败。
+//   策略：UTF-8 解出替换符（U+FFFD）时回退 GBK 解码（Node/Electron 内置全量 ICU）。
+function decodeConsoleOutput(buffer) {
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(String(buffer || ''))
+  const utf8 = buf.toString('utf8')
+  if (!utf8.includes('\uFFFD')) return utf8
+  try { return new TextDecoder('gbk').decode(buf) } catch { return utf8 }
+}
+
 // 通过 dsh 命令 / 常见全局安装位置 / npm+pnpm 全局根，定位 @deepseek-ai/dsh 包根。
 // 参照 deepseek-harness-box：`Get-Command dsh` 的 shim 在 <prefix>，包在 <prefix>\node_modules\@deepseek-ai\dsh。
 function findDshPackageRoots() {
@@ -122,7 +137,7 @@ function findDshPackageRoots() {
   }
   // 1) dsh 命令 shim：where dsh → C:\Users\x\AppData\Roaming\npm\dsh.cmd
   try {
-    const where = String(execFileSync('where.exe', ['dsh'], { encoding: 'utf8', windowsHide: true, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }) || '')
+    const where = decodeConsoleOutput(execFileSync('where.exe', ['dsh'], { windowsHide: true, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }) || '')
     for (const line of where.split(/\r?\n/)) {
       const p = String(line || '').trim()
       if (!p) continue
@@ -136,10 +151,10 @@ function findDshPackageRoots() {
   // 2) npm / pnpm 全局根（cmd 包装，避免 Node 直接 exec .cmd 的 EINVAL）
   for (const tool of ['npm', 'pnpm']) {
     try {
-      const whereTool = String(execFileSync('where.exe', [tool], { encoding: 'utf8', windowsHide: true, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }) || '')
+      const whereTool = decodeConsoleOutput(execFileSync('where.exe', [tool], { windowsHide: true, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }) || '')
       const toolPath = whereTool.split(/\r?\n/).map(s => s.trim()).find(Boolean)
       if (!toolPath) continue
-      const rootOut = String(execFileSync('cmd.exe', ['/c', `"${toolPath}" root -g`], { encoding: 'utf8', windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim()
+      const rootOut = decodeConsoleOutput(execFileSync('cmd.exe', ['/c', `"${toolPath}" root -g`], { windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim()
       if (rootOut) {
         push(path.join(rootOut, '@deepseek-ai', 'dsh'))
         push(path.join(rootOut, 'node_modules', '@deepseek-ai', 'dsh'))
@@ -192,9 +207,12 @@ function inspectDshDir(value) {
   if (fs.existsSync(cliDir)) {
     try {
       const pkg = JSON.parse(fs.readFileSync(packageFile, 'utf8'))
-      if (pkg.name !== '@deepseek-ai/dsh-root' && !Array.isArray(pkg.workspaces)) return null
-      return { dir, version: String(pkg.version || '未知'), name: path.basename(dir) || 'DeepSeek Harness', mode: 'source' }
-    } catch { return null }
+      // ★ 1.4.0：源码校验不过时继续落到 npm 包形态分支——安装根残留空 apps\cli 目录
+      //   （或源码 clone 进一键安装目录）时，不再直接判 null 漏掉完整 npm 安装
+      if (pkg.name === '@deepseek-ai/dsh-root' || Array.isArray(pkg.workspaces)) {
+        return { dir, version: String(pkg.version || '未知'), name: path.basename(dir) || 'DeepSeek Harness', mode: 'source' }
+      }
+    } catch { /* 继续尝试 npm 包形态 */ }
   }
   // npm 包形态：node_modules 里有 @deepseek-ai/dsh 完整包（lib/bin.js 存在）
   const npmPkgFile = path.join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
@@ -230,16 +248,6 @@ function inspectDshDir(value) {
   return null
 }
 
-// 解析 "{pid}|{commandLine}" 行 → { pid, commandLine }；无效返回 null
-function parseProcessEntry(line) {
-  const text = String(line || '')
-  const sep = text.indexOf('|')
-  if (sep <= 0) return null
-  const pid = Number(text.slice(0, sep))
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null
-  return { pid, commandLine: text.slice(sep + 1) }
-}
-
 // 列出 Windows 上 node/dsh 进程：pid|命令行|cwd|监听端口（只读探测）。
 // cwd 通过进程 PEB 读取（Node 进程常以相对路径 apps/cli 启动，命令行里没有根目录）。
 // 监听端口用于命令行未带 --port 时确定实例实际端口。
@@ -266,6 +274,9 @@ function processEntries() {
       "return System.Text.Encoding.Unicode.GetString(s); } finally { CloseHandle(h); } } }'",
     ].join(' ')
     const command = [
+      // ★ 1.4.0：强制 UTF8 输出——中文系统 powershell.exe 默认 OEM(cp936)，中文 cwd 经
+      //   管道回传会变乱码 → 相对路径运行实例识别失败
+      "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;",
       "$dll=Join-Path $env:TEMP 'dsh-cwd-probe.dll';",
       "if (-not (Test-Path $dll)) { Add-Type -TypeDefinition " + csharp + " -OutputAssembly $dll -ErrorAction SilentlyContinue };",
       "try { Add-Type -Path $dll -ErrorAction Stop } catch { Add-Type -TypeDefinition " + csharp + " -ErrorAction SilentlyContinue };",
@@ -377,6 +388,19 @@ function firstFreePortAvoiding(registeredPorts = [], reservedPorts = [], isPortF
 // 目录名不重要（源码形态惯例叫 deepseek-harness，npm 包形态可能叫任何名字，如 D:\2），
 // 只要里面是 DSH 程序就算。运行时枚举盘符，不含任何个人路径字面量，白板/隐私不受影响。
 // options.processEntries 可注入（[{pid,commandLine}]）。
+// ★ 1.4.0：本机固定磁盘盘符（DriveType=3）。断链/慢速网络映射盘的 existsSync 可阻塞数秒，
+//   逐盘扫描前先过滤断网盘；查询失败（如 PowerShell 受限）回退全盘符（旧行为）。
+let localDrivesCache = null
+function localFixedDrives() {
+  if (localDrivesCache) return localDrivesCache
+  try {
+    const out = String(execFileSync('powershell.exe', ['-NoProfile', '-Command', "(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3').DeviceID"], { windowsHide: true, timeout: 6000, stdio: ['ignore', 'pipe', 'ignore'] }) || '')
+    const letters = out.split(/\r?\n/).map(s => s.trim().toUpperCase()).filter(s => /^[A-Z]:$/.test(s))
+    localDrivesCache = letters.length ? letters : null
+  } catch { localDrivesCache = null }
+  return localDrivesCache
+}
+
 async function scanDshInstallations(options = {}) {
   const explicit = Array.isArray(options.explicit) ? options.explicit : []
   const entries = Array.isArray(options.processEntries)
@@ -427,9 +451,12 @@ async function scanDshInstallations(options = {}) {
     }
     // 每个磁盘根目录一级：任意名字（如 D:\2），内容识别后自动过滤非 DSH
     if (scanDrives) {
+      const fixedDrives = localFixedDrives()
       for (let code = 65; code <= 90; code++) {
         const root = `${String.fromCharCode(code)}:\\`
         try {
+          // ★ 1.4.0：只扫本机固定盘（查询成功时）；跳过网络/可移动盘（断链盘 existsSync 卡数秒）
+          if (fixedDrives && !fixedDrives.includes(root.slice(0, 2).toUpperCase())) continue
           if (fs.existsSync(root)) {
             for (const dir of collectLevel1Dirs(root)) common.push(dir)
             // 每盘根再深两级（用户自选路径常见，如 D:\环境\DSH 或 D:\工具\代理\harness）
@@ -469,7 +496,9 @@ async function scanDshInstallations(options = {}) {
     //   DSH 的深层目录（pnpm workspace 软链让 apps\cli\node_modules\@deepseek-ai\dsh 被误认成
     //   独立安装），绝不能接入成第二个终端（DSH_HOME/profile/端口互相打架）。
     //   浅目录先 to 入 acceptedRoots（运行实例/显式目录/深度浅的优先），子路径自动排除。
-    if (acceptedRoots.some(root => key.startsWith(root + '\\') || key.startsWith(root + '/'))) return
+    //   ★ 1.4.0：key 长度≤3（盘根，如 'd:'）不作为排除前缀——一键安装到盘根时会把同盘
+    //   其他真实 DSH 全部误当成子目录排除。
+    if (key.length > 3 && acceptedRoots.some(root => key.startsWith(root + '\\') || key.startsWith(root + '/'))) return
     seen.add(key)
     acceptedRoots.push(key)
     results.push({ ...inspected, source: meta.source, port: meta.port || null, pid: meta.pid || null })

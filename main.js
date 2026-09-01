@@ -778,11 +778,14 @@ function pushTerminalLog(terminalId, level, text, kind = '', conv = '') {
 let toolchainEnvCache = null
 let toolchainEnvCacheAt = 0
 
-async function getToolchainEnv(terminalId) {
+async function getToolchainEnv(terminalId, onProgress = null) {
   const now = Date.now()
   // 缓存 5 分钟：启动/更新/引擎安装高频调用时不重复自举（自举本身幂等且快，但少跑一次是一次）
   if (toolchainEnvCache && now - toolchainEnvCacheAt < 5 * 60 * 1000) return toolchainEnvCache
   const log = (stage, message) => {
+    // ★ 1.4.0（I5）：支持 onProgress 透传——一键安装向导此前在自举阶段（可达数分钟）
+    //   完全无进度，用户当卡死强关
+    if (onProgress) { try { onProgress(stage, message) } catch { /* 进度失败不阻断 */ } }
     if (terminalId) pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`)
   }
   const toolchain = await freshInstall.ensureUpdateToolchain({
@@ -793,8 +796,11 @@ async function getToolchainEnv(terminalId) {
   // ★ 完整缓存 env + pnpmExe（1.0.13 修复：旧实现只存 env，自举好的 pnpmExe 被丢弃，
   //   所有 toolchainEnv.pnpmExe 取值永远是 undefined → 回退 findPnpm 探测，链路脱节）
   //   nodeExe 一并缓存：无系统 Node 的机器由工具链自举的 node 接续 registry/版本探测。
+  // ★ 1.4.0（U16）：关键项（node+pnpm）齐备才缓存 5 分钟；残缺工具链只缓存 30 秒，
+  //   避免一次半失败的自举（TEMP 被清/网络抖动）污染后续 5 分钟内的所有调用
   toolchainEnvCache = { env: toolchain.env, pnpmExe: toolchain.pnpmExe || '', nodeExe: toolchain.nodeExe || '' }
-  toolchainEnvCacheAt = now
+  const healthy = !!toolchainEnvCache.nodeExe && !!toolchainEnvCache.pnpmExe
+  toolchainEnvCacheAt = now - (healthy ? 0 : 4.5 * 60 * 1000)
   return toolchainEnvCache
 }
 
@@ -826,6 +832,12 @@ function findNodeExe() {
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs', 'node.exe'),
     'node',
   ]
+  // ★ 1.4.0（I10）：工具链自举位置纳入候选——无系统 Node 的机器上，一键安装先把 node
+  //   自举到 %TEMP%\zat-tools，startTerminal 不该再对 userData/tools 重复下载一份
+  try {
+    const tools = freshInstall.normalToolsDir()
+    candidates.push(path.join(tools, 'zat-tools', 'node.exe'))
+  } catch { /* 忽略 */ }
   // 常见开发工具自带的 node（runtime 缓存目录），递归探测不硬编码个人路径。
   // 例：~/.cache/<tool-runtime>/dependencies/node/bin/node.exe
   const findUnderCache = (dir, depth) => {
@@ -951,6 +963,15 @@ async function runAutoFixLevel(terminalId, p, issue, level) {
 async function reinstallProfileBundles(terminalId, p) {
   const tcEnv = await getToolchainEnv(terminalId)
   const updateExecute = makeToolchainExecute(tcEnv.env)
+  // ★ 1.4.0（A6）：bundle 与主包强制同号（主包版本从已装 dshDir/package.json 读取）
+  const mainVersion = (() => {
+    try {
+      const pkgFile = path.join(p.dshDir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+      const alt = path.join(p.dshDir, 'package.json')
+      const raw = fs.existsSync(pkgFile) ? pkgFile : (fs.existsSync(alt) ? alt : '')
+      return raw ? (JSON.parse(fs.readFileSync(raw, 'utf8')).version || '') : ''
+    } catch { return '' }
+  })()
   return freshInstall.installProfileBundles({
     nodeExe: tcEnv.nodeExe || findNodeExe(),
     profileDir: p.profileDir,
@@ -958,6 +979,7 @@ async function reinstallProfileBundles(terminalId, p) {
     onProgress: (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`),
     execute: updateExecute,
     force: true,
+    version: mainVersion,
   })
 }
 
@@ -1048,13 +1070,19 @@ function listPortPids(port) {
 // required」，HTTP 标记（deepseek/__dsh_boot__/harness）匹配不了 → 旧逻辑把在跑的 DSH
 // 误判成"非 Harness 服务占用"（端口冲突刷屏 / 启动 90 秒超时失败）。
 // 识别规则：监听进程 cmdline 含 bin.js ... web（源码/npm/全局形态）或 deepseek-harness。
-const HARNESS_CMDLINE_RE = /(bin\.js[\s"']+web|deepseek[-_]harness|@deepseek-ai[/\\]dsh)/i
+const HARNESS_CMDLINE_RE = /(bin\.[jt]s[\s"']+web(?![\w-])|deepseek[-_]harness|@deepseek-ai[/\\]dsh)/i
+// ★ 1.4.0（F08/F11）：identifyHarness 按 pid 做 30 秒 TTL 缓存——进程 cmdline 不变，
+//   缓存消除 port-conflict 期间每 2 秒一轮的 powershell 拉起（CPU/能耗 churn）
+const harnessPidCache = new Map() // pid -> { ok, at }
 function identifyHarnessPid(pid) {
   return new Promise(resolve => {
     if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return resolve(false)
+    const cached = harnessPidCache.get(Number(pid))
+    if (cached && Date.now() - cached.at < 30000) return resolve(cached.ok)
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}").CommandLine`], { windowsHide: true, timeout: 8000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
-      if (error || !stdout) return resolve(false)
-      resolve(HARNESS_CMDLINE_RE.test(String(stdout)))
+      const ok = !error && !!stdout && HARNESS_CMDLINE_RE.test(String(stdout))
+      harnessPidCache.set(Number(pid), { ok, at: Date.now() })
+      resolve(ok)
     })
   })
 }
@@ -1157,7 +1185,7 @@ function openWebPage(url, source, terminalId) {
 // ★ 1.3.1：DSH 启动时从 stdout 捕获「dsh web: http://127.0.0.1:<port>/?token=...」
 // 新版 DSH（0.1.2-alpha.1+）web 需 token 鉴权——不带 token 打开会被 401 拒（页面提示
 // "reopen the URL printed by dsh web"）。autoOpen / 「打开网页」按钮都用带 token 的地址。
-const READY_URL_RE = /dsh web:\s*(https?:\/\/\S+)/i
+const READY_URL_RE = /dsh web:\s*(https?:\/\/[^\s'\"）>，,]+)/i
 const readyUrls = new Map() // terminalId -> 带 token 的完整 URL
 
 async function startTerminal(terminalId, startOptions = {}) {
@@ -1165,15 +1193,21 @@ async function startTerminal(terminalId, startOptions = {}) {
   const p = terminalPaths(terminalId)
   const runtime = terminalSupervisor.get(terminalId)
   await terminalSupervisor.check(terminalId)
-  const startLogIndex = runtime.logs.length
   if (runtime.state === 'running' || runtime.state === 'attached-running') return { ok: true, message: `终端已在运行（端口 ${p.port}）` }
   if (runtime.starting) return { ok: false, message: '该终端正在启动中' }
   if (runtime.portListening && !runtime.harnessConfirmed) return { ok: false, message: `端口 ${p.port} 已被其他程序占用` }
   if (!p.dshDir || !looksLikeDshDir(p.dshDir)) return { ok: false, message: `DSH 目录无效：${p.dshDir || '未设置'}` }
+  // ★ 1.4.0（F01）：启动锁立即置位——此前 starting 在全部联网自举（可达数分钟）之后才置位，
+  //   期间双击启动按钮/重复 IPC 会并发跑两个 startTerminal，spawn 双 DSH 抢同一端口与 profile
+  runtime.starting = true
 
   // ===== 启动终端 = 重新开始记录（上一个启动周期的实时日志抛弃，UI 面板从本次启动开始） =====
   // ① 清空内存日志（UI 只显示本次启动之后的内容）
   runtime.logs.length = 0
+  // ★ 1.4.0（F02）：startLogIndex 必须在清空【之后】捕获——旧代码在清空前捕获，
+  //   崩溃时 slice(旧长度) 拿到空数组 → diagnoseCrash 永远空手 → L1-L3 自动恢复阶梯
+  //   整体失效（启动器重启后历史预填 3000 条时必然如此）
+  const startLogIndex = runtime.logs.length
   // 每次启动重新签发的 token：清掉旧的鉴权地址
   readyUrls.delete(terminalId)
   // ② 重置该终端的会话游标 + 记录启动时刻：只记本次启动之后发生的事
@@ -1209,9 +1243,18 @@ async function startTerminal(terminalId, startOptions = {}) {
   // 有全局 pnpm.cjs 就复制一份过去；没有则自举到共享目录——无论哪种，zat-tools 里始终有。
   try {
     const sharedDir = path.join(freshInstall.normalToolsDir(), 'zat-tools')
-    // 清理过期 .cmd 包装残留：内容可能引用已消失的 node/pnpm.cjs，
-    // 且 Node 24 无 shell 时 execFile(.cmd) 直接 EINVAL（0.6.19 一键安装失败的根因之一）。
-    try { fs.rmSync(path.join(sharedDir, 'pnpm.cmd'), { force: true }) } catch { /* 忽略 */ }
+    // 清理过期 .cmd 包装残留：仅当内容引用的 node/pnpm 已消失才删（1.4.0 起zat-tools\pnpm.cmd
+    // 是刻意生成的构建 shim，供 DSH 构建脚本里的裸 `pnpm` 解析，不能无脑删）。
+    // Node 24 无 shell 时 execFile(.cmd) 直接 EINVAL 的约束只作用于启动器自己的 execFile
+    // （一律 node <cjs>，不受影响）；DSH 构建脚本经 cmd shell 解析 .cmd 是安全的。
+    try {
+      const staleShim = path.join(sharedDir, 'pnpm.cmd')
+      const shimContent = fs.existsSync(staleShim) ? fs.readFileSync(staleShim, 'utf8') : ''
+      const refs = [...shimContent.matchAll(/"([^"]+)"/g)].map(m => m[1])
+      if (!shimContent || (refs.length && refs.some(p => !fs.existsSync(p)))) {
+        fs.rmSync(staleShim, { force: true })
+      }
+    } catch { /* 忽略 */ }
     const sharedPnpm = path.join(sharedDir, 'pnpm.cjs')
     if (!fs.existsSync(sharedPnpm)) {
       fs.mkdirSync(sharedDir, { recursive: true })
@@ -1316,6 +1359,13 @@ async function startTerminal(terminalId, startOptions = {}) {
     } catch (e) {
       pushTerminalLog(terminalId, 'error', `源码依赖自动安装异常：${friendlyError(e)}`)
     }
+  }
+  // ★ 1.4.0（F04）：预备段（工具链自举/引擎下载可达数分钟）里用户点了停止 → 中止启动。
+  //   旧代码无视取消继续 spawn，显式停止被静默吞掉，DSH 照常起来
+  if (runtime.cancelRequested || runtime.stopping) {
+    runtime.starting = false
+    terminalSupervisor.setTransition(terminalId, { state: 'stopped', starting: false })
+    return { ok: false, message: '启动已取消' }
   }
   const { file, args, cwd, env } = spawnDshArgs(webArgs, p.dshDir, p.terminal, toolchainEnv && toolchainEnv.env || undefined, (toolchainEnv && toolchainEnv.nodeExe) || undefined)
   // 根修弹窗：启动器无控制台 GUI 直接 spawn 控制台程序会让 Windows 给每个子进程开新可见窗口。
@@ -1477,7 +1527,10 @@ async function startTerminal(terminalId, startOptions = {}) {
 
   const deadline = Date.now() + (CONFIG.startTimeoutMs || 90000)
   while (Date.now() < deadline) {
-    if (runtime.cancelRequested || runtime.generation !== generation) return { ok: false, message: '启动已取消' }
+    if (runtime.cancelRequested || runtime.generation !== generation) {
+      runtime.starting = false
+      return { ok: false, message: '启动已取消' }
+    }
     const status = await terminalSupervisor.check(terminalId)
     // 就绪必须同时满足：端口是 harness 且本次 spawn 的进程仍存活。
     // check 在 probeInFlight 时返回缓存状态，崩溃循环里可能误报 running——用 childProcess 存活做硬校验。
@@ -1915,7 +1968,14 @@ async function killProcessesUsing(roots) {
       const pid = Number(line.slice(0, idx))
       const cmd = line.slice(idx + 1)
       if (!cmd) continue
-      if (roots.some(root => root && cmd.includes(root))) {
+      // ★ 1.4.0（F12）：子串匹配会误伤——root='...t1' 命中 '...t10'。改为「root 后必须跟
+      //   路径分隔符/引号/行尾」的边界匹配，t1 不再命中 t10；前缀匹配保持宽容以保证删除可靠
+      const hit = roots.some(root => {
+        if (!root) return false
+        const esc = String(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        return new RegExp(`${esc}([\\\\/'"]|$)`, 'i').test(cmd)
+      })
+      if (hit) {
         try { await killPid(pid) } catch { /* 忽略 */ }
       }
     }
@@ -1940,6 +2000,8 @@ async function envRemove(id) {
   terminalSupervisor.stopMonitoring(id)
   terminalRegistry.remove(id)
   ENVIRONMENTS = ENVIRONMENTS.filter((item) => item.id !== id)
+  // ★ 1.4.0（F15）：清掉该终端的鉴权地址/会话游标等内存态，防泄漏
+  readyUrls.delete(id)
   try {
     const key = `${resolveHome(terminal.dshHome)}|`
     for (const k of [...sessionTailState.keys()]) if (k.startsWith(key)) sessionTailState.delete(k)
@@ -2065,15 +2127,18 @@ async function flushPendingDeletes() {
 // 全新安装失败清理：只删启动器自己创建的安装产物，绝不动用户文件夹里的其他内容。
 // （教训：之前失败时 fs.rmSync(root) 会递归删除用户选择的整个文件夹——若里面混有
 // 用户自己的文件会被一并误删。）
+// ★ 1.4.0（A3）：传入安装前目录快照 preExisting——安装前就存在的同名条目（用户自己的
+// package.json/.npmrc/profiles/zat-* 等）一律跳过不删，彻底杜绝误删用户数据。
 const INSTALL_ARTIFACTS = ['node_modules', '.tools', 'profiles', 'package.json', 'package-lock.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'cordis.yml', 'zat-*']
-function cleanInstallArtifacts(root) {
+function cleanInstallArtifacts(root, preExisting = null) {
   for (const rel of INSTALL_ARTIFACTS) {
     try {
       if (rel.includes('*')) {
         for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
-          if (ent.name.startsWith('zat-')) fs.rmSync(path.join(root, ent.name), { recursive: true, force: true })
+          if (ent.name.startsWith('zat-') && !(preExisting && preExisting.has(ent.name))) fs.rmSync(path.join(root, ent.name), { recursive: true, force: true })
         }
       } else {
+        if (preExisting && preExisting.has(rel)) continue // 安装前已存在 = 用户的东西，绝不删
         fs.rmSync(path.join(root, rel), { recursive: true, force: true })
       }
     } catch { /* ignore */ }
@@ -2100,10 +2165,25 @@ async function installFreshTerminal(options = {}) {
   const dshHome = root
   const profileDir = path.join(dshHome, 'profiles', 'web')
   const detectedNodeExe = findNodeExe()
+  // ★ 1.4.0（A3）：记录安装前已存在的条目——失败清理只删【本次安装创建的】产物，
+  //   用户原有的同名文件（自己的 package.json/.npmrc/profiles 等）绝不删（数据安全）
+  const preExisting = new Set(fs.existsSync(root) ? fs.readdirSync(root) : [])
+  // ★ 1.4.0（A3）：目录里已有 package.json 但没有 node_modules = 疑似用户自己的 Node 项目
+  //   （一键安装会改写其 package.json/生成 lockfile；失败清理会误删）——直接拒绝，保护数据
+  if (preExisting.has('package.json') && !preExisting.has('node_modules')) {
+    return { ok: false, message: `所选目录已有 package.json（疑似你自己的项目），为保护数据不在此安装。请选择空文件夹或新建目录` }
+  }
   // 白板原则：一键安装/部署全部使用启动器内置工具链（node/pnpm/npm/git 自举到 zat-tools），
   // 不依赖机器预装。先自举工具链，后续 installOfficialPackage / downloadEngineTo /
   // installProfileBundles 的 pnpm/npm/git 调用全部走内置工具。
-  const installTcEnv = await getToolchainEnv('')
+  // ★ 1.4.0（I4/I5）：自举移入 try 且进度透传到向导——旧实现自举抛错=IPC reject（向导
+  //   永远停在"准备开始…"无提示）；自举数分钟无进度被用户当卡死强关
+  let installTcEnv
+  try {
+    installTcEnv = await getToolchainEnv('', onProgress)
+  } catch (err) {
+    return { ok: false, message: `工具链自举失败：${friendlyError(err)}` }
+  }
   // 工具链自举返回的 nodeExe 优先：无系统 Node 的机器也用它做后续 registry/版本探测
   const nodeExe = installTcEnv.nodeExe || detectedNodeExe
   const installExecute = makeToolchainExecute(installTcEnv.env)
@@ -2122,9 +2202,9 @@ async function installFreshTerminal(options = {}) {
       execute: installExecute,
       pnpmExe: installTcEnv.pnpmExe || '',
     })
-    if (!dl.ok) { cleanInstallArtifacts(root); return { ok: false, message: dl.message } }
+    if (!dl.ok) { cleanInstallArtifacts(root, preExisting); return { ok: false, message: dl.message } }
     if (!fs.existsSync(path.join(dshDir, 'lib', 'bin.js'))) {
-      cleanInstallArtifacts(root)
+      cleanInstallArtifacts(root, preExisting)
       return { ok: false, message: '安装完成但缺少 dsh 可执行入口，已清理' }
     }
     // 安装完成即打"无窗口"补丁（subprocess windowsHide），启动时也会再校验一次
@@ -2163,8 +2243,13 @@ async function installFreshTerminal(options = {}) {
       toolsDir: path.join(freshInstall.normalToolsDir(), 'zat-tools'),
       onProgress,
       execute: installExecute,
+      // ★ 1.4.0（A6）：bundle 与主包强制同号——错位即 "Unknown file extension .css" 启动崩
+      version: (() => { try { return JSON.parse(fs.readFileSync(path.join(dshDir, 'package.json'), 'utf8')).version || '' } catch { return '' } })(),
     })
-    if (!bundlesOk.ok) return { ok: false, message: bundlesOk.message }
+    if (!bundlesOk.ok) {
+      cleanInstallArtifacts(root, preExisting)
+      return { ok: false, message: bundlesOk.message }
+    }
     // 3) 填充当前空终端；只有没有目标空终端时才新增记录。
     fs.mkdirSync(dshHome, { recursive: true })
     const name = target ? target.name : (options.name || '新环境')
@@ -2198,7 +2283,7 @@ async function installFreshTerminal(options = {}) {
       startOk: start.ok,
     }
   } catch (err) {
-    cleanInstallArtifacts(root)
+    cleanInstallArtifacts(root, preExisting)
     return { ok: false, message: `全新安装失败，已清理半成品：${friendlyError(err)}` }
   }
 }
@@ -2334,6 +2419,14 @@ function registerIpc() {
       pnpmExe,
       probeLatest: harnessUpdate.npmLatestProbe(tcEnv.nodeExe || findNodeExe()),
       onStep: (msg) => pushTerminalLog(id, 'info', `[更新] ${msg}`),
+      // ★ 1.4.0（U12）：回滚前先停终端——运行中的 DSH 持有 lib/node_modules 文件句柄，
+      //   不停就回滚必然 EPERM/EBUSY，"绝不留半更新状态"的承诺在运行中场景才真正可达
+      beforeRestore: async () => {
+        if (wasRunning) {
+          pushTerminalLog(id, 'warn', '回滚前先停止终端（运行中文件被锁，否则恢复必失败）…')
+          await stopTerminal(id, { confirmAttached: true, silent: true })
+        }
+      },
       npmUpdater: async () => {
         // 更新主包（npm 包形态），成功后再强制同步 profile bundle 到 @next：
         // 主包升级后 bundle 不跟上的话，rc 错配导致启动崩溃（Unknown file extension .css）。
@@ -2353,6 +2446,8 @@ function registerIpc() {
           onProgress: (stage, message) => pushTerminalLog(id, 'info', `[${stage}] ${message}`),
           execute: updateExecute,
           force: true,
+          // ★ 1.4.0（A6）：bundle 与新主包强制同号
+          version: up.version || '',
         })
         if (!bundles.ok) return { ok: false, message: `主包已更新，但 profile 插件同步失败：${bundles.message}` }
         return { ...up, message: `${up.message}；profile 插件已同步` }
@@ -2455,7 +2550,8 @@ function registerIpc() {
     const explicit = current && current.dshDir ? [current.dshDir] : []
     try {
       const results = await scanDshInstallations({ explicit })
-      const registered = new Map((terminalRegistry ? terminalRegistry.list() : []).map(t => [normalizeDshPath(t.dshDir), t]))
+      // ★ 1.4.0（S8）：判重键套 normalizeNpmRoot——旧版以包根登记的终端不再被标成"未登记"
+      const registered = new Map((terminalRegistry ? terminalRegistry.list() : []).map(t => [normalizeDshPath(normalizeNpmRoot(t.dshDir || '')), t]))
       const enriched = results.map(item => {
         const existing = registered.get(normalizeDshPath(item.dir))
         return { ...item, registered: !!existing, terminalId: existing ? existing.id : '' }
@@ -2477,8 +2573,12 @@ function registerIpc() {
     const r = await dialog.showOpenDialog(state.win, { properties: ['openDirectory'], title: '选择 DSH 安装目录' })
     if (r.canceled || !r.filePaths.length) return { ok: false, canceled: true, message: '已取消' }
     const inspected = inspectDshDir(r.filePaths[0])
-    if (!inspected) return { ok: false, message: '所选目录不是有效的 DeepSeek Harness 根目录' }
-    return ok({ inspected }, '目录有效')
+    if (inspected) return ok({ inspected }, '目录有效')
+    // ★ 1.4.0（B1）：选的不一定是根目录——向下自动查找（旧实现直接报"无效"，
+    //   findDshRootNear 的下钻能力在手动接入路径根本不可达，用户唯一的出路断头）
+    const near = findDshRootNear(r.filePaths[0])
+    if (near) return ok({ inspected: near }, `已在所选目录内找到 DSH：${near.dir}`)
+    return { ok: false, message: '所选目录（含其 4 层内子目录）都不是有效的 DeepSeek Harness 根目录' }
   })
 
   ipcMain.handle('terminals:connect-directory', async (_e, dshDirInput, options) => {
@@ -2503,6 +2603,21 @@ function registerIpc() {
       const r = await dialog.showOpenDialog(state.win, { properties: ['openDirectory', 'createDirectory'], title: '选择终端环境目录（可新建文件夹）' })
       if (r.canceled || !r.filePaths.length) return { ok: false, canceled: true, message: '已取消' }
       dir = r.filePaths[0]
+      // ★ 1.4.0（A4 数据安全）：拒绝把终端建在删除时会连累用户数据的目录——
+      //   用户主目录本身、其一级子目录（Desktop/Documents/Downloads 等）、~/.dsh（真实 DSH 数据）、
+      //   盘根。这些目录一旦登记为 fresh-empty，删除终端 = 整棵物理删除且无回收站。
+      try {
+        const resolved = path.resolve(dir)
+        const homeNorm = path.resolve(os.homedir()).toLowerCase()
+        const rel = path.relative(homeNorm, resolved)
+        const firstLevel = rel && !rel.startsWith('..') && !path.isAbsolute(rel) && rel.split(path.sep).filter(Boolean).length <= 1
+        const isHomeOrLevel1 = resolved.toLowerCase() === homeNorm || firstLevel
+        const isDshHome = /(^|[\\/])\.dsh($|[\\/])/i.test(resolved)
+        const isDriveRoot = /^[A-Z]:\\?$/i.test(resolved)
+        if (isHomeOrLevel1 || isDshHome || isDriveRoot) {
+          return { ok: false, message: '该目录包含系统/DSH 数据，删除终端时会一并清掉，请选择一个专用的新文件夹（如在 D 盘新建）' }
+        }
+      } catch { /* 校验失败不阻断 */ }
     }
     // 目录里已有 DSH：转为接入（manual 语义：真实 home），端口从扫描结果继承
     const existingDsh = inspectDshDir(normalizeNpmRoot(dir))
@@ -3040,3 +3155,4 @@ process.on('unhandledRejection', (reason) => {
 try {
   if (!fs.existsSync(configUserPath())) saveUserConfig()
 } catch { /* 忽略 */ }
+

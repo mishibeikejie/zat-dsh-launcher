@@ -40,6 +40,19 @@ function planTerminalDeletion(terminal, others, userData) {
   let roots = []
 
   if (sourceType === 'fresh-empty') {
+    // ★ 数据安全（1.4.0）：fresh-empty 允许用户选任意目录建终端，删除时会整棵物理删除。
+    //   若用户选的是 ~/.dsh（真实 DSH 数据）、其内部、用户主目录本身或其一级子目录
+    //   （Desktop/Documents/Downloads 等），删除等于清掉用户真实数据 —— 一律拒绝删除。
+    const homeDirNorm = normalizeNonEmpty(os.homedir())
+    const defaultNorm = normalizeNonEmpty(defaultHome)
+    const insideHomedirDepth = (() => {
+      const rel = path.relative(homeDirNorm, home)
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return -1
+      return rel.split(path.sep).filter(Boolean).length
+    })()
+    if (pathsOverlap(defaultHome, home) || homeDirNorm === home || (insideHomedirDepth >= 0 && insideHomedirDepth <= 1)) {
+      return { registrationOnly: false, roots: [], blocked: true, reason: 'protected-home', conflict: home }
+    }
     roots = [home]
   } else {
     // 删除范围 = 该终端独占的目录：

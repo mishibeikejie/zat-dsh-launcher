@@ -9,7 +9,7 @@ const path = require('node:path')
 const os = require('node:os')
 const { execFile, spawn } = require('node:child_process')
 const { EventEmitter } = require('node:events')
-const { updateSources } = require('./harness-update')
+const { updateSources, compareVersions } = require('./harness-update')
 const { wrapJsFile } = require('./toolchain-execute')
 
 const DSH_ORIGIN = 'https://github.com/deepseek-ai/deepseek-harness.git'
@@ -142,14 +142,44 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run }) {
   const rawDir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
   const dir = (() => { try { fs.mkdirSync(rawDir, { recursive: true }); return fs.realpathSync(rawDir) } catch { return normalToolsDir() + '\\zat-tools' } })()
   const cached = path.join(dir, 'pnpm.mjs')
-  if (fs.existsSync(cached)) return cached
+  const nodeBin = nodeExe && nodeExe !== 'pnpm' ? nodeExe : 'node'
+  // ★ 1.4.0：缓存命中先体检（node pnpm.mjs --version）——损坏的 pnpm.mjs 被永久信任会让
+  //   所有安装/更新报语法错误且永不自愈（同 npmCliHealthy/probeGit 的体检惯例）
+  const healthy = async () => {
+    try {
+      const r = await run(nodeBin, [cached, '--version'], null, 8000)
+      return r.ok && /\d+\.\d+/.test(r.out)
+    } catch { return false }
+  }
+  if (fs.existsSync(cached)) {
+    if (await healthy()) return cached
+    if (onProgress) onProgress('依赖', '自举 pnpm 缓存自检失败，重新复制…')
+    try { fs.rmSync(cached, { force: true }) } catch { /* 忽略 */ }
+  }
   const existing = findPnpm()
   if (existing) return existing
   // 内置 pnpm（assets/pnpm.cjs = 官方 dist/pnpm.mjs 单文件）：直接复制，零下载零安装。
   // asarUnpack 后 Electron 会把 asar 路径透明映射到 resources/app.asar.unpacked 物理文件，
   // 但显式探测物理路径更稳（打包机/便携版路径不同）。复制失败 = 安装包异常，如实抛出。
   const src = path.join(__dirname, '..', 'assets', 'pnpm.cjs')
-  fs.copyFileSync(src, cached)
+  // ★ 1.4.0：tmp + rename 原子落盘——两个进程并发冷启动（便携版换 userData 可双开）
+  //   直接 copyFileSync 到目标会互相截断，产出损坏的 pnpm.mjs
+  const tmp = `${cached}.${process.pid}.tmp`
+  try {
+    fs.copyFileSync(src, tmp)
+    fs.renameSync(tmp, cached)
+  } catch {
+    try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
+    fs.copyFileSync(src, cached)
+  }
+  if (!(await healthy())) {
+    // 体检仍失败：再重拷一次（复制中断/杀软瞬时锁场景），尽力而为
+    try {
+      fs.rmSync(cached, { force: true })
+      fs.copyFileSync(src, tmp)
+      fs.renameSync(tmp, cached)
+    } catch { /* 忽略 */ }
+  }
   return cached
 }
 
@@ -216,10 +246,16 @@ function downloadFileNative(url, dest, onProgress, timeoutMs = 60000, redirects 
       try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略：残留文件可能被占用，用带重试的打开覆盖 */ }
       // ★ 杀软扫描/占用导致的 EPERM 重试：国内用户机器常见（createWriteStream 报
       //   EPERM: operation not permitted, open '<path>'——朋友实机截图根因）。
+      // ★ 1.4.0 修正：createWriteStream 的 EPERM 发生在【异步 open】，同步 try/catch 接不住
+      //   （1.3.x 的重试是死代码），且写入流无 error 监听会变成主进程未捕获异常。
+      //   改用 fs.openSync（同步抛错，重试真实生效）+ createWriteStream(null,{fd})，并挂 error。
       const openStream = () => new Promise((res, rej) => {
         let attempt = 0
         const tryOpen = () => {
-          try { res(fs.createWriteStream(tmp, { flags: 'w' })) } catch (err) {
+          try {
+            const fd = fs.openSync(tmp, 'w')
+            res(fs.createWriteStream(null, { fd, autoClose: true }))
+          } catch (err) {
             attempt += 1
             if (attempt >= 4) return rej(err)
             setTimeout(tryOpen, 500 * attempt)
@@ -228,6 +264,12 @@ function downloadFileNative(url, dest, onProgress, timeoutMs = 60000, redirects 
         tryOpen()
       })
       const startPump = (out) => {
+        out.on('error', err => {
+          try { out.destroy() } catch { /* 忽略 */ }
+          try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
+          try { response.destroy() } catch { /* 忽略 */ }
+          resolve({ ok: false, err: `写入临时文件失败：${err.message}` })
+        })
         response.on('data', chunk => {
           received += chunk.length
           out.write(chunk)
@@ -276,10 +318,12 @@ async function withRetry(fn, times = 3, delayMs = 400, retryable = () => true) {
 // 曾出现 node_modules/node-gyp/bin/node-gyp.js 与 lib/commands/* 缺失（解压残留/杀软删除），
 // 任何 `npm run ...` 都瞬间崩 MODULE_NOT_FOUND（exit 1），导致 DSH 更新构建全链失败。
 // 体检标准：node <cli> --version 8 秒内成功输出 11.x，且 node_modules 与入口存在。
-async function npmCliHealthy(nodeExe, cliPath) {
+// ★ 1.4.0（U4）：支持注入 env（工具链 PATH 含 node 目录）——无系统 node 的机器上
+//   'node' 也能解析，npm 路径不再被误跳过
+async function npmCliHealthy(nodeExe, cliPath, env = undefined) {
   try {
     if (!cliPath || !fs.existsSync(cliPath)) return false
-    const r = await run(nodeExe, [cliPath, '--version'], null, 8000)
+    const r = await run(nodeExe, [cliPath, '--version'], null, 8000, env)
     if (!r.ok) return false
     if (!/^\s*\d+\.\d+\.\d+/.test(r.out)) return false
     const pkgRoot = path.dirname(path.dirname(cliPath))
@@ -467,6 +511,20 @@ async function ensureUpdateToolchain({ nodeExe, toolsDir, onProgress, execute = 
       extraDirs.push(path.dirname(pnpmExe))
     }
   }
+  // ★ 1.4.0：生成 pnpm.cmd 包装——DSH 构建脚本（master 的 build:web = 裸 `pnpm --filter ...`）
+  //   由 npm run 经 cmd shell 执行，需要 PATH 上可解析 pnpm；我们自己的 execFile 一律
+  //   node <cjs>，不受 Node24 execFile(.cmd) EINVAL 影响（shim 仅供脚本环境解析）。
+  //   没有系统 pnpm 的白板机器上，缺这个 shim 会让 build:web ENOENT → 更新永远回滚。
+  try {
+    const shim = path.join(dir, 'pnpm.cmd')
+    const pnpmEntry = /\.mjs$/i.test(String(pnpmExe)) ? String(pnpmExe) : path.join(dir, 'pnpm.mjs')
+    if (nodePath && fs.existsSync(pnpmEntry)) {
+      const want = `@echo off\r\n"${nodePath}" "${pnpmEntry}" %*\r\n`
+      let needWrite = true
+      try { needWrite = fs.readFileSync(shim, 'utf8') !== want } catch { needWrite = true }
+      if (needWrite) fs.writeFileSync(shim, want, 'utf8')
+    }
+  } catch { /* shim 失败不阻断（有系统 pnpm 的机器不需要） */ }
   // 4) git：系统 git 优先，没有则自举 PortableGit 到 zat-tools\git（官方 GitHub → ghfast/gh-proxy 镜像）
   const gitExe = await ensureGit({ toolsDir: dir, onProgress, execute })
   if (gitExe) extraDirs.push(path.dirname(gitExe))
@@ -841,7 +899,7 @@ async function spawnWithHiddenConsole(program, args, options = {}) {
 // 优先 pnpm（store 命中快），回退自举 npm CLI；以包实装为准（pnpm 可能因构建脚本被忽略返回非 0）。
 // force=true：忽略"已存在跳过"，强制重装到 @next（DSH 主包更新后必须同步，
 // 否则 rc 错配导致启动崩溃：Unknown file extension .css / ERR_UNKNOWN_FILE_EXTENSION）。
-async function installProfileBundles({ nodeExe, profileDir, toolsDir, onProgress, execute = runWithProgress, force = false }) {
+async function installProfileBundles({ nodeExe, profileDir, toolsDir, onProgress, execute = runWithProgress, force = false, version = '' }) {
   const check = () =>
     fs.existsSync(path.join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-base')) &&
     fs.existsSync(path.join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-web-app'))
@@ -855,12 +913,20 @@ async function installProfileBundles({ nodeExe, profileDir, toolsDir, onProgress
   // 但 pnpm 的 @next 标签在"已装过"目录解析不可靠（实测 add @next 仍装出旧 rc.7），
   // 必须用 dist-tags 动态解析出的具体版本号（rc.7→rc.8 更新实测 3.9s 成功）；
   // 解析失败才回退 @next 标签。
-  const baseV = await resolvePackageVersion(nodeExe, '@deepseek-ai/dsh-base')
-  const webV = await resolvePackageVersion(nodeExe, '@deepseek-ai/dsh-web-app')
-  const spec = [
-    baseV ? `@deepseek-ai/dsh-base@${baseV}` : '@deepseek-ai/dsh-base@next',
-    webV ? `@deepseek-ai/dsh-web-app@${webV}` : '@deepseek-ai/dsh-web-app@next',
-  ]
+  // ★ 1.4.0：调用方传入主包 version 时，bundle 与主包【强制同号】——bundle 与主包版本
+  //   错位是 "Unknown file extension .css" 启动崩的根因；钉定版本安装失败（registry 无
+  //   该版本）才回退旧的独立解析（max(latest,next)）。
+  const fallbackSpecs = async () => {
+    const baseV = await resolvePackageVersion(nodeExe, '@deepseek-ai/dsh-base')
+    const webV = await resolvePackageVersion(nodeExe, '@deepseek-ai/dsh-web-app')
+    return [
+      baseV ? `@deepseek-ai/dsh-base@${baseV}` : '@deepseek-ai/dsh-base@next',
+      webV ? `@deepseek-ai/dsh-web-app@${webV}` : '@deepseek-ai/dsh-web-app@next',
+    ]
+  }
+  const attempts = []
+  if (version) attempts.push([`@deepseek-ai/dsh-base@${version}`, `@deepseek-ai/dsh-web-app@${version}`])
+  attempts.push(await fallbackSpecs())
   let pnpmExe = executablePnpm(findPnpm(), nodeExe)
   if (!pnpmExe) {
     // pnpm 不可用时自举一次（与主包安装一致），绝不回退 npm（依赖树性能崩塌）
@@ -869,16 +935,27 @@ async function installProfileBundles({ nodeExe, profileDir, toolsDir, onProgress
       pnpmExe = executablePnpm(boot, nodeExe)
     } catch { pnpmExe = '' }
   }
-  if (pnpmExe) {
-    if (onProgress) onProgress('依赖', '用 pnpm 安装 profile 官方 bundle（dsh-base / dsh-web-app）…')
-    try { fs.writeFileSync(path.join(profileDir, '.npmrc'), 'dangerously-allow-all-builds=true\n', 'utf8') } catch { /* 忽略 */ }
-    // package-import-method=copy：与主包安装一致，终端完全独立拷贝，删除/更新互不影响
-    const r = await execute('依赖', pnpmExe, ['add', ...spec, '--dir', profileDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 10 * 60 * 1000, envForCli)
-    if (check()) return { ok: true }
+  if (!pnpmExe) {
+    return { ok: false, message: 'profile 官方 bundle 安装失败（pnpm 不可用，自举失败）' }
+  }
+  if (onProgress) onProgress('依赖', '用 pnpm 安装 profile 官方 bundle（dsh-base / dsh-web-app）…')
+  try { fs.writeFileSync(path.join(profileDir, '.npmrc'), 'dangerously-allow-all-builds=true\n', 'utf8') } catch { /* 忽略 */ }
+  // package-import-method=copy：与主包安装一致，终端完全独立拷贝，删除/更新互不影响
+  let lastErr = ''
+  for (const spec of attempts) {
+    // ★ 1.4.0：退出码必须检查——旧实现只要目录存在就判成功，pnpm add 失败（网络/磁盘）
+    //   或装出旧版时误报 ok → 主包/bundle 版本错位启动崩
+    const r = await execute('依赖', pnpmExe, ['add', ...spec, '--dir', profileDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 30 * 60 * 1000, envForCli)
+    if (r.ok && check()) return { ok: true, version: version || '' }
+    lastErr = (r.err || r.out || lastErr || '').trim().split(/\r?\n/).slice(-2).join(' | ')
+    if (check() && !r.ok) {
+      // 目录在但退出码非 0：半安装，重试下一组 spec
+      if (onProgress) onProgress('依赖', `bundle 安装退出码非 0（${lastErr.slice(-120)}），尝试下一版本策略…`)
+    }
   }
   // npm 回退已移除（1.0.9）：npm 对 @deepseek-ai/* 依赖树解析性能崩塌（实测死转），
   // pnpm 均失败时明确报错，绝不掉进 npm 白等。
-  return { ok: false, message: 'profile 官方 bundle 安装失败（dsh-base / dsh-web-app 未实装，pnpm 不可用）' }
+  return { ok: false, message: `profile 官方 bundle 安装失败（dsh-base / dsh-web-app 未实装）：${lastErr || '无输出'}` }
 }
 
 // 修补 DSH 的 subprocess-local 实现：child_process.spawn 加 windowsHide: true，
@@ -943,17 +1020,9 @@ function patchDshSubprocessNoWindow(rootDir) {
 // 返回版本号字符串（如 '0.1.0-rc.8'）；全部源不可达返回 ''（调用方回退标签）。
 async function resolveLatestDshVersion(nodeExe, timeoutMs = 3000) {
   const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||""))}).catch(()=>process.exit(1))'
-  const verCmp = (a, b) => {
-    const pa = String(a).split(/[.\-]/).map(x => parseInt(x, 10) || 0)
-    const pb = String(b).split(/[.\-]/).map(x => parseInt(x, 10) || 0)
-    const len = Math.max(pa.length, pb.length)
-    for (let i = 0; i < len; i++) {
-      const x = pa[i] || 0
-      const y = pb[i] || 0
-      if (x !== y) return x - y
-    }
-    return 0
-  }
+  // ★ 1.4.0：verCmp 换用 harness-update.compareVersions——旧实现 parseInt('rc')=0，
+  //   '0.1.2-rc.1' 被判大于同号正式版 '0.1.2'（语义颠倒，可能装到降级预发布版）
+  const verCmp = compareVersions
   for (const base of NPM_REGISTRIES) {
     const url = `${String(base).replace(/\/$/, '')}/-/package/${DSH_NPM_PACKAGE}/dist-tags`
     const r = await run(nodeExe, ['-e', script, url], null, timeoutMs)
@@ -971,17 +1040,8 @@ async function resolveLatestDshVersion(nodeExe, timeoutMs = 3000) {
 // pnpm 的 @next 标签在"已装过"目录解析不可靠，必须用具体版本号）
 async function resolvePackageVersion(nodeExe, pkgName, timeoutMs = 3000) {
   const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||""))}).catch(()=>process.exit(1))'
-  const verCmp = (a, b) => {
-    const pa = String(a).split(/[.\-]/).map(x => parseInt(x, 10) || 0)
-    const pb = String(b).split(/[.\-]/).map(x => parseInt(x, 10) || 0)
-    const len = Math.max(pa.length, pb.length)
-    for (let i = 0; i < len; i++) {
-      const x = pa[i] || 0
-      const y = pb[i] || 0
-      if (x !== y) return x - y
-    }
-    return 0
-  }
+  // ★ 1.4.0：同 resolveLatestDshVersion——统一 compareVersions 语义（预发布 < 正式版）
+  const verCmp = compareVersions
   for (const base of NPM_REGISTRIES) {
     const url = `${String(base).replace(/\/$/, '')}/-/package/${pkgName}/dist-tags`
     const r = await run(nodeExe, ['-e', script, url], null, timeoutMs)
@@ -1035,13 +1095,13 @@ async function installOfficialPackage({ nodeExe, toolsDir, targetDir, onProgress
     //   所有终端共享同一份原生模块（如 sharp）——3080 加载着它时，其它终端里同版本
     //   的文件永远删不掉（0.6.29 删除残留根因，nlink=8 实测证实）。
     //   copy 模式让每个终端完全独立拷贝：删除/更新互不影响，真正"终端 100% 独立"。
-    const r = await execute('下载', pnpmExeResolved, ['add', spec, '--dir', targetDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 10 * 60 * 1000, envForCli)
+    const r = await execute('下载', pnpmExeResolved, ['add', spec, '--dir', targetDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 30 * 60 * 1000, envForCli)
     // ★ EPERM/EBUSY 重试（杀软扫描/文件占用瞬时锁，重试通常通过——朋友实机全新安装失败根因）
     let rFinal = r
     if (!r.ok && /EPERM|EBUSY|EACCES/i.test(String(r.err || '') + String(r.out || ''))) {
       if (onProgress) onProgress('下载', '文件被占用（EPERM/EBUSY，常见于杀软扫描），等待后重试一次…')
       await new Promise(res => setTimeout(res, 1500))
-      rFinal = await execute('下载', pnpmExeResolved, ['add', spec, '--dir', targetDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 10 * 60 * 1000, envForCli)
+      rFinal = await execute('下载', pnpmExeResolved, ['add', spec, '--dir', targetDir, '--registry', registry, '--config.dangerously-allow-all-builds=true', '--config.package-import-method=copy'], undefined, onProgress, 30 * 60 * 1000, envForCli)
     }
     // 以 bin.js 就位为准：pnpm 可能因原生构建脚本被忽略而返回非 0（ERR_PNPM_IGNORED_BUILDS），
     // 但预构建包本体已安装成功。缺失的原生模块由 DSH 首次启动时按需处理。
@@ -1123,3 +1183,4 @@ module.exports = {
   npmCliHealthy, withRetry,
   DSH_ORIGIN, DSH_NPM_PACKAGE, DSH_NPM_TAG, NPM_REGISTRIES, SOURCE_TIMEOUT_MS,
 }
+

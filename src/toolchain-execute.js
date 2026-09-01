@@ -36,6 +36,11 @@ function makeToolchainExecute(env) {
   const execWithEnv = (file, args, cwd, timeout, envOverride) => {
     const n = wrapJsFile(expandExec(file, args))
     return new Promise(resolve => {
+      // ★ 执行器不可用（如 pnpm 自举失败传 null）→ 明确失败结果而不是 execFile(null) 同步抛
+      //   ERR_INVALID_ARG_TYPE 变成未捕获 reject（曾让更新在 merge 后无回滚无提示）
+      if (!n.file || typeof n.file !== 'string') {
+        return resolve({ ok: false, code: -1, out: '', err: '执行器不可用（可执行文件为空，多为工具链自举失败）' })
+      }
       execFile(n.file, n.args, {
         cwd,
         windowsHide: true,
@@ -61,6 +66,9 @@ function makeToolchainExecute(env) {
       const timeout = a6 || 600000
       const n = wrapJsFile(expandExec(a2, a3))
       return new Promise(resolve => {
+        if (!n.file || typeof n.file !== 'string') {
+          return resolve({ ok: false, code: -1, out: '', err: '执行器不可用（可执行文件为空，多为工具链自举失败）' })
+        }
         const child = execFile(n.file, n.args, {
           cwd: a4,
           windowsHide: true,
@@ -93,8 +101,9 @@ function makeToolchainExecute(env) {
         if (child.stderr) pump(child.stderr)
       })
     }
-    // run 风格：(file, args, cwd, timeout)
-    return execWithEnv(a1, a2, a3, a4, undefined)
+    // run 风格：(file, args, cwd, timeout[, envOverride]) —— ★ 第 5 参 envOverride 此前被
+    //   硬编码丢弃，runBuild 精心构造的 buildEnv（pnpm 目录前置）全部失效；现真实生效。
+    return execWithEnv(a1, a2, a3, a4, a5)
   }
   fn.env = env
   return fn

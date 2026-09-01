@@ -74,16 +74,21 @@ function findNpmCli(env) {
 // 任何 `npm run` 都瞬间崩，导致 DSH 更新构建全链失败。逐个候选体检（node <cli> --version），
 // 第一个能用的返回；全坏则尝试自举重下修复；仍无返回 ''（调用方走 pnpm 直构兜底）。
 async function findHealthyNpmCli(env, nodeFile, execute = run, onStep = null) {
+  const fi = require('./fresh-install')
+  // ★ 1.4.0（U4）：体检与 node 预检都走注入的 execute（其闭包 env 已含工具链 node 目录）——
+  //   旧实现用模块级 run（继承主进程 env），无系统 Node 但工具链已自举 node 的机器上
+  //   node 预检必败 → npm 路径被误判整体跳过（即便工具链 npm 完全健康）
+  const probeExec = typeof execute === 'function' ? execute : run
+  const probeEnv = (typeof execute === 'function' && execute.env) || undefined
   const tryProbe = async (cli) => {
     if (!cli) return false
-    const fi = require('./fresh-install')
-    return fi.npmCliHealthy(nodeFile, cli)
+    return fi.npmCliHealthy(nodeFile, cli, probeEnv)
   }
   // ★ 先确认 node 可执行：受限环境/测试下 'node' 可能不在 PATH（spawn ENOENT）——
   //   此时重下 npm CLI 毫无意义（也要 node 跑），直接放弃，避免对多个 registry
   //   做无谓的重下+体检循环（每源几秒，异常环境拖慢 20 秒）。
   try {
-    const nodeProbe = await run(nodeFile, ['--version'], null, 6000)
+    const nodeProbe = await probeExec(nodeFile, ['--version'], null, 6000)
     if (!nodeProbe.ok) return ''
   } catch { return '' }
   const candidates = []
@@ -96,7 +101,6 @@ async function findHealthyNpmCli(env, nodeFile, execute = run, onStep = null) {
   }
   // 全坏：重新自举（ensureNpmCli 内部也会体检）
   try {
-    const fi = require('./fresh-install')
     const step = onStep || (() => {})
     step('npm CLI 自检异常，正在重新下载修复…')
     const cli = await fi.ensureNpmCli({
@@ -104,7 +108,7 @@ async function findHealthyNpmCli(env, nodeFile, execute = run, onStep = null) {
       toolsDir: path.join(os.tmpdir(), 'zat-tools'),
       onProgress: (d, m) => step(`[${d}] ${m}`),
     })
-    if (cli && (await fi.npmCliHealthy(nodeFile, cli))) return cli
+    if (cli && (await fi.npmCliHealthy(nodeFile, cli, probeEnv))) return cli
   } catch { /* 修复失败 → 返回 '' 走 pnpm 兜底 */ }
   return ''
 }
@@ -138,7 +142,7 @@ async function runPnpmDirect(dshDir, execute, pnpmExe, env, step) {
     if (scripts['build:web']) {
       step('pnpm 直构：build:web（上游可能引用不存在的 filter 包，可容忍跳过）')
       const r = await runScript('build:web')
-      if (!r.ok && !/No projects matched the filters/i.test(String(r.err || r.out || ''))) {
+      if (!r.ok && !/No projects matched the filters|ERR_PNPM_NO_MATCHED_FILTERS/i.test(String((r.err || '') + '\n' + (r.out || '')))) {
         return fail(`pnpm 直构 build:web 失败：${String(r.err || r.out || '').slice(-800)}`)
       }
     }
@@ -150,23 +154,47 @@ async function runPnpmDirect(dshDir, execute, pnpmExe, env, step) {
 
 // ★ 幽灵工作区目录清理（2026-08-29 实机根因之二）：git 回滚不会删除「合并时新建、回滚后残留」
 // 的未跟踪包目录（实测上次更新从 master 合并出 27 个新包目录，回滚后仅剩 node_modules 空壳）。
-// tsdown 的 workspace glob（packages/*/*、vendor/*、apps/cli）会匹配到这些幽灵目录 →
+// tsdown 的 workspace glob（packages/*/*、vendor/*、apps/cli、website）会匹配到这些幽灵目录 →
 // 解析共享入口（lib/types/*）失败 → 整个构建秒败（Cannot find entry: ["lib/types/..."]）。
-// 规则：workspace glob 覆盖的目录中，git 未跟踪、且内容仅剩构建残留（node_modules/lib/dist/
-// .typecheck/tsbuildinfo）的一律删除；含其他文件（用户自己的内容）则保护不动。
+// 规则：workspace glob 覆盖的目录中，git 未跟踪、且内容仅为构建残留（node_modules/lib/dist/
+// .typecheck/tsbuildinfo 递归确认）的一律删除；含其他文件（用户自己的内容）则保护不动。
+// ★ 1.4.0（U6）：vendor 是一级包（vendor/*）、website 也是成员——旧实现 vendor 按两级展开
+//   导致 vendor 层幽灵永不清理；（U7）残留判定改为递归确认，用户藏在自建 lib/ 里的数据不再被误删。
+function isResidueTree(dir, depth = 0) {
+  let entries
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return false }
+  if (!entries.length) return true // 空目录视为残留
+  if (depth > 2) return false // 太深不确认，保守保留
+  for (const e of entries) {
+    if (e.name === 'node_modules') continue // 包管理器产物，无论内容都是残留
+    if (e.name.endsWith('.tsbuildinfo')) continue
+    const full = path.join(dir, e.name)
+    if (e.isDirectory()) {
+      if (['lib', 'dist', '.typecheck'].includes(e.name)) {
+        if (!isResidueTree(full, depth + 1)) return false
+        continue
+      }
+      return false // 未知子目录 = 可能是用户数据，保护
+    }
+    // 文件：只允许构建产物扩展名
+    if (!/\.(js|mjs|cjs|d\.ts|map|tsbuildinfo|json)$/i.test(e.name)) return false
+  }
+  return true
+}
+
 async function cleanUntrackedWorkspaceDirs(dshDir, execute, step) {
   const RESIDUE = new Set(['node_modules', 'lib', 'dist', '.typecheck'])
   let removed = 0
-  for (const group of ['packages', 'vendor', 'apps']) {
+  for (const group of ['packages', 'vendor', 'apps', 'website']) {
     const groupDir = path.join(dshDir, group)
     let children
     try { children = fs.readdirSync(groupDir, { withFileTypes: true }) } catch { continue }
     for (const c of children) {
       if (!c.isDirectory()) continue
-      // vendor/* 与 packages/*/* 是两级；apps/* 是一级
+      // packages/*/* 是两级；vendor/*、apps/*、website/* 是一级（与 pnpm-workspace glob 对齐）
       const first = path.join(groupDir, c.name)
       let candidates = [first]
-      if (group !== 'apps') {
+      if (group === 'packages') {
         let inner
         try { inner = fs.readdirSync(first, { withFileTypes: true }) } catch { continue }
         candidates = inner.filter(x => x.isDirectory()).map(x => path.join(first, x.name))
@@ -181,7 +209,8 @@ async function cleanUntrackedWorkspaceDirs(dshDir, execute, step) {
         } catch { continue }
         let entries
         try { entries = fs.readdirSync(cand, { withFileTypes: true }) } catch { continue }
-        const onlyResidue = entries.every(e => RESIDUE.has(e.name) || e.name.endsWith('.tsbuildinfo'))
+        const onlyResidue = entries.every(e => RESIDUE.has(e.name) || e.name.endsWith('.tsbuildinfo')) &&
+          entries.every(e => !['lib', 'dist', '.typecheck'].includes(e.name) || isResidueTree(path.join(cand, e.name), 0))
         if (!onlyResidue) continue
         try {
           fs.rmSync(cand, { recursive: true, force: true })
@@ -300,8 +329,7 @@ async function runBuild(dshDir, execute, env, pnpmExe, onStep) {
   step('build:lib 完成，继续 build:web')
   r = await runNpm('build:web')
   if (r.ok) return { ok: true, used: 'npm run build:lib + build:web' }
-  const webErr = String(r.err || r.out || '')
-  if (/No projects matched the filters/i.test(webErr)) {
+  if (/No projects matched the filters|ERR_PNPM_NO_MATCHED_FILTERS/i.test(String((r.err || '') + '\n' + (r.out || '')))) {
     return { ok: true, used: 'npm run build:lib（build:web 上游脚本引用不存在的包，已智能跳过）', skippedWeb: true }
   }
   return { ok: false, err: `build:web 失败：${webErr.slice(-1500)}` }
@@ -454,15 +482,21 @@ async function checkUpdate(dshDir, execute = run, probeLatest = null) {
     if (fetched.ok) { source = candidate; break }
   }
   if (!source) return { ...local, ok: true, checkFailed: true, updateAvailable: false, canInstall: false, message: '网络暂不可用，未完成更新检查' }
-  const [remoteHead, behind, remotePackage] = await Promise.all([
+  const [remoteHead, behind, ahead, remotePackage] = await Promise.all([
     execute('git', ['rev-parse', '--short', remoteRef], dshDir),
     execute('git', ['rev-list', '--count', `HEAD..${remoteRef}`], dshDir),
+    execute('git', ['rev-list', '--count', `${remoteRef}..HEAD`], dshDir),
     execute('git', ['show', `${remoteRef}:package.json`], dshDir),
   ])
   if (!remoteHead.ok || !behind.ok) return { ...local, ok: false, message: `无法读取远端分支 ${remoteRef}` }
   let remoteVersion = '未知'
   try { remoteVersion = JSON.parse(remotePackage.out).version || '未知' } catch { /* keep unknown */ }
   const behindCount = Number(behind.out) || 0
+  const aheadCount = ahead.ok ? (Number(ahead.out) || 0) : 0
+  // ★ 1.4.0（U11）：本地领先/分叉时 merge --ff-only 必败——提前给出可操作指引而非每次
+  //   安装都失败一次（还可能白 stash 一次）
+  const diverged = aheadCount > 0 && behindCount > 0
+  const localAhead = aheadCount > 0 && behindCount === 0
   return {
     ...local,
     ok: true,
@@ -473,8 +507,13 @@ async function checkUpdate(dshDir, execute = run, probeLatest = null) {
     behindCount,
     updateAvailable: behindCount > 0,
     // 有本地修改也能安装：安装时会自动 stash 暂存备份，更新完成后恢复（见 installUpdate）
-    canInstall: behindCount > 0,
-    message: behindCount > 0 ? `发现 ${behindCount} 个新提交（远端 ${remoteVersion}）` : `当前已是最新版本（${local.version}，HEAD ${local.commit}）`,
+    // ★ 本地有提交（领先/分叉）时不可安装：ff-only 必败
+    canInstall: behindCount > 0 && aheadCount === 0,
+    message: diverged
+      ? `本地与远端分叉（本地多 ${aheadCount} 个提交、远端多 ${behindCount} 个），无法快进更新。如需官方版本请先处理本地提交（git stash / reset）`
+      : localAhead
+        ? `本地已领先远端 ${aheadCount} 个提交，无需更新（如需官方版本请先回退本地提交）`
+        : behindCount > 0 ? `发现 ${behindCount} 个新提交（远端 ${remoteVersion}）` : `当前已是最新版本（${local.version}，HEAD ${local.commit}）`,
   }
 }
 
@@ -530,21 +569,47 @@ function findPkgByName(dshDir, name) {
 }
 
 // 验证关键包编译产物存在（更新/恢复后 DSH 能启动的最低要求）
-function verifyKeyArtifacts(dshDir) {
-  const keys = ['@deepseek-ai/dsh-host-apiproxy', '@deepseek-ai/dsh-app-boot', '@deepseek-ai/dsh-session-persistence-jsonl', '@deepseek-ai/dsh-client-runtime']
+// ★ 1.4.0（U5）：master 已删除 dsh-host-apiproxy、client-runtime 更名 client-test-runtime——
+//   找不到的 key 记入警告；命中数 <2 视为布局失配（守门不能因 keys 全过时而空转）
+function verifyKeyArtifacts(dshDir, onWarn = null) {
+  const warn = (msg) => { try { if (onWarn) onWarn(msg) } catch { /* 忽略 */ } }
+  const keys = [
+    '@deepseek-ai/dsh-host-apiproxy', // 旧版（≤rc.2，master 已删除）
+    '@deepseek-ai/dsh-app-boot',
+    '@deepseek-ai/dsh-session-persistence-jsonl',
+    '@deepseek-ai/dsh-client-runtime', // 旧版
+    '@deepseek-ai/dsh-client-test-runtime', // master 更名后
+  ]
+  let matched = 0
   for (const pkg of keys) {
     const dir = findPkgByName(dshDir, pkg)
     if (!dir) continue
+    matched++
     if (!fs.existsSync(path.join(dir, 'lib', 'index.js'))) return { ok: false, missing: pkg }
   }
-  return { ok: true }
+  if (matched < 2) {
+    warn(`产物验证仅命中 ${matched} 个关键包（键列表可能与该 DSH 版本布局失配，请人工确认产物完整）`)
+  }
+  return { ok: true, matched }
+}
+
+// ★ 1.4.0（U18）：错误信息保留首行 + 尾部——tsc/构建脚本首个错误（往往最根本）此前
+//   被纯尾部 slice 丢弃，用户与维护者看到的都是次生错误
+function errHeadTail(text, max = 1500) {
+  const s = String(text || '').trim()
+  if (s.length <= max) return s
+  const head = s.slice(0, 400)
+  const tail = s.slice(-(max - 420))
+  return `${head}\n…(中间省略)…\n${tail}`
 }
 
 // 恢复旧版本到可运行状态：回滚代码 + 清增量缓存 + 重装依赖 + 重建旧代码产物
-async function restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm) {
+async function restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm, step = null) {
   const steps = []
+  const progress = (msg) => { try { if (step) step(msg) } catch { /* 忽略 */ } }
   // ★ 结果必须核验（1.2.3 修复）：旧实现 push('代码已回滚') 不看 reset 结果与 HEAD，
   //   真实回滚失败时仍谎称"已回滚"（实测 0.1.1-rc.2 树回滚失败但提示"代码已回滚"）。
+  progress('正在回滚代码到更新前…')
   const reset = await execute('git', ['reset', '--hard', oldHead], dshDir, 120000)
   if (!reset.ok) return { ok: false, err: `代码回滚失败：${String(reset.err || reset.out || '').slice(-300)}` }
   const headAfter = await execute('git', ['rev-parse', 'HEAD'], dshDir)
@@ -554,7 +619,8 @@ async function restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm
   steps.push('代码已回滚')
   clearTsBuildInfo(dshDir)
   // ★ 回滚后清理幽灵工作区目录（更新合并时新建、回滚后残留的未跟踪包目录）
-  await cleanUntrackedWorkspaceDirs(dshDir, execute, () => {})
+  await cleanUntrackedWorkspaceDirs(dshDir, execute, progress)
+  progress('正在重装依赖…')
   let restoreInstall = { ok: false }
   for (const args of installAttempts) {
     restoreInstall = await execute(pnpm, args, dshDir, 15 * 60 * 1000)
@@ -562,11 +628,13 @@ async function restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm
   }
   if (!restoreInstall.ok) return { ok: false, err: `依赖恢复失败：${String(restoreInstall.err || '').slice(-500)}（${steps.join('、')}）` }
   steps.push('依赖已重装')
+  progress('正在重建旧版本产物…')
   const restore = await runBuild(dshDir, execute, execute && execute.env || process.env, pnpm)
   if (!restore.ok) return { ok: false, err: `旧版本重建失败：${String(restore.err || '').slice(-500)}（${steps.join('、')}）` }
+  steps.push('产物重建')
   const artifact = verifyKeyArtifacts(dshDir)
   if (!artifact.ok) return { ok: false, err: `旧版本产物缺失：${artifact.missing}（${steps.join('、')}）` }
-  return { ok: true, detail: `${steps.join(' + ')} + 产物重建` }
+  return { ok: true, detail: `${steps.join(' + ')}` }
 }
 
 async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
@@ -636,28 +704,38 @@ async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
   // runBuild 内部多级自适应：npm run build → 分步 build:lib/build:web → pnpm run build 兜底。
   // 1.0.7 提速：先保留 tsc 增量缓存编译（只重编译变化的包，通常几十秒）；
   // 产物验证不通过才清缓存强制全量重编（旧逻辑每次全量 2~5 分钟）。
-  step('开始编译（增量模式：仅重编译变化的包）…')
-  let build = install.ok ? await runBuild(dshDir, execute, execute && execute.env || process.env, pnpm, step) : { ok: false, err: '依赖安装失败' }
-  let artifact = install.ok && build.ok ? verifyKeyArtifacts(dshDir) : { ok: true }
+  // ★ 1.4.0（U17）："开始编译"只在依赖安装成功后提示（旧实现 install 失败也打，日志与阶段不符）
+  let build = install.ok ? (step('开始编译（增量模式：仅重编译变化的包）…'), await runBuild(dshDir, execute, execute && execute.env || process.env, pnpm, step)) : { ok: false, err: '依赖安装失败' }
+  let artifact = install.ok && build.ok ? verifyKeyArtifacts(dshDir, step) : { ok: true }
   if (install.ok && (!build.ok || artifact.ok === false)) {
     // 增量编译失败/产物缺失：清缓存强制全量编译（旧版可靠路径）
     step('增量编译未满足要求，切换全量编译（清 tsc 缓存，约 2~5 分钟）…')
     clearTsBuildInfo(dshDir)
     build = await runBuild(dshDir, execute, execute && execute.env || process.env, pnpm, step)
-    artifact = build.ok ? verifyKeyArtifacts(dshDir) : { ok: true }
+    artifact = build.ok ? verifyKeyArtifacts(dshDir, step) : { ok: true }
   }
   if (!install.ok || !build.ok || !artifact.ok) {
     // 失败：完整恢复旧版本可运行状态（代码回滚 + 清缓存 + 重装依赖 + 重建旧代码产物），
     // 绝不留「新代码 + 旧产物 / 旧代码 + 新产物」的混合状态（曾导致更新后 DSH 起不来）。
+    // ★ 1.4.0（U12）：回滚前先停终端（options.beforeRestore）——运行中的 DSH 持有
+    //   lib/node_modules 文件句柄，不停就回滚必然 EPERM/EBUSY
     let fail = (install.ok ? build.err : install.err || '依赖安装失败') || '未知错误'
     if (artifact.ok === false) fail = `编译产物缺失（${artifact.missing}）：${fail}`
-    const restored = await restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm)
+    if (typeof options.beforeRestore === 'function') {
+      try { await options.beforeRestore() } catch { /* 停止失败不阻断回滚尝试 */ }
+    }
+    const restored = await restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm, step)
     const restoredNote = restored.ok
       ? `已完整恢复旧版本（${restored.detail}），DSH 可正常启动`
       : `已回滚代码，但旧版本恢复失败：${restored.err}`
-    return { ...info, ok: false, rolledBack: true, message: `更新验证失败：${String(fail).slice(-1500)}。${restoredNote}` }
+    // ★ 1.4.0（U18）：错误保留首行 + 尾部——tsc/构建首个错误（最根本的）此前被纯尾部截断
+    return { ...info, ok: false, rolledBack: true, message: `更新验证失败：${errHeadTail(fail, 1500)}。${restoredNote}` }
   }
+  // ★ 1.4.0（U13）：更新成功后清掉本次 stash（按设计"本地修改不要了"，留着只会在
+  //   stash list 无限堆积）
+  if (stashed) { try { await execute('git', ['stash', 'drop'], dshDir, 60000) } catch { /* 清理失败不阻断 */ } }
   return { ...(await localInfo(dshDir, execute)), updateAvailable: false, message: 'Harness 已更新到官方版本' }
 }
 
 module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli, findHealthyNpmCli, runPnpmDirect, cleanUntrackedWorkspaceDirs }
+

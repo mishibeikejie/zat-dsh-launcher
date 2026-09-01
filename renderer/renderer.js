@@ -841,6 +841,13 @@ async function wizardInstall() {
       els.wizardBack.hidden = false
       els.wizardBack.onclick = () => WIZARD_VIEWS.menu()
     }
+  } catch (err) {
+    // ★ 1.4.0（I4）：IPC reject 未捕获会让向导永远停在"准备开始…"——必须渲染错误
+    const msg = (err && err.message) || String(err || '未知错误')
+    append('失败', msg)
+    toast(`全新安装失败：${msg}`, 'error')
+    els.wizardBack.hidden = false
+    els.wizardBack.onclick = () => WIZARD_VIEWS.menu()
   } finally {
     if (typeof unsubscribe === 'function') unsubscribe()
   }

@@ -71,13 +71,32 @@ test('downloadDshTo 走克隆并带进度；已存在则跳过', async () => {
 })
 
 test('ensurePnpm 缓存 exists 时直接返回（内置 pnpm 单文件）', async () => {
-  // 1.0.11：ensurePnpm 不再下载 tgz，缓存 pnpm.mjs 存在即返回；不存在则从资产内置复制。
+  // 1.0.11：ensurePnpm 不再下载 tgz；★ 1.4.0：缓存命中先体检（node pnpm.mjs --version），
+  // 健康即返回，损坏自动从内置资产重拷（防杀软删文件/并发截断的永久损坏）
   const dir = tmp('zat-pnpm')
   fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, 'pnpm.mjs'), '#!/usr/bin/env node\nconsole.log("fake")\n')
+  const realAsset = fs.readFileSync(path.join(__dirname, '..', 'assets', 'pnpm.cjs'))
+  fs.writeFileSync(path.join(dir, 'pnpm.mjs'), realAsset)
   const nodeExe = process.execPath
   const got = await ensurePnpm({ nodeExe, toolsDir: dir })
   assert.equal(got, path.join(dir, 'pnpm.mjs'))
+  // 内容仍是健康缓存（未被覆盖）
+  assert.ok(fs.readFileSync(path.join(dir, 'pnpm.mjs')).length === realAsset.length)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('ensurePnpm 缓存损坏时自动从内置资产重拷（1.4.0 回归）', async () => {
+  const dir = tmp('zat-pnpm-bad')
+  fs.mkdirSync(dir, { recursive: true })
+  const corrupt = 'this is not javascript {{{'
+  fs.writeFileSync(path.join(dir, 'pnpm.mjs'), corrupt)
+  const nodeExe = process.execPath
+  const got = await ensurePnpm({ nodeExe, toolsDir: dir })
+  // 损坏缓存必须被淘汰：要么原地替换为内置资产内容，要么改用健康的系统 pnpm——
+  // 绝不把损坏文件原样返回
+  const stillCorrupt = fs.existsSync(path.join(dir, 'pnpm.mjs')) && fs.readFileSync(path.join(dir, 'pnpm.mjs'), 'utf8') === corrupt
+  assert.equal(stillCorrupt, false)
+  assert.ok(typeof got === 'string' && got.length > 0)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
