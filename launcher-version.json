@@ -1,5 +1,5 @@
 {
-  "version": "1.3.1",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.3.1/ZAT-DSH-Launcher-Setup-1.3.1.exe",
-  "notes": "v1.3.1 修复：新版 DSH（0.1.2-alpha.1+）web 加 token 鉴权后，启动器误把在跑的 DSH 判为\"非 Harness 服务占用\"（被占用刷屏+启动超时失败）、自动打开的网页 401（提示需要鉴权 URL）——已支持识别鉴权响应与进程 cmdline，并自动用带 token 的地址打开网页。"
+  "version": "1.4.0",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.0/ZAT-DSH-Launcher-Setup-1.4.0.exe",
+  "notes": "v1.4.0 全链路审计修复（67 项发现，本批修 35 项）：崩溃自愈阶梯失效修复（此前日志索引错位导致自动恢复从不触发）；杀软锁文件下载真重试（旧实现是死代码）；安装失败清理不再误删用户文件；删除终端拒绝波及 ~/.dsh 与用户主目录；白板机器更新必败修复（pnpm shim）；bundle 与主包强制同号；手动接入选父目录自动下钻；pnpm 全局装法识别修正；中文系统编码修复；扫描跳过断链网络盘；启动双开防护等。"
 }
