@@ -1,5 +1,5 @@
 {
-  "version": "1.4.0",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.0/ZAT-DSH-Launcher-Setup-1.4.0.exe",
-  "notes": "v1.4.0 全链路审计修复（67 项发现，本批修 35 项）：崩溃自愈阶梯失效修复（此前日志索引错位导致自动恢复从不触发）；杀软锁文件下载真重试（旧实现是死代码）；安装失败清理不再误删用户文件；删除终端拒绝波及 ~/.dsh 与用户主目录；白板机器更新必败修复（pnpm shim）；bundle 与主包强制同号；手动接入选父目录自动下钻；pnpm 全局装法识别修正；中文系统编码修复；扫描跳过断链网络盘；启动双开防护等。"
+  "version": "1.4.1",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.1/ZAT-DSH-Launcher-Setup-1.4.1.exe",
+  "notes": "v1.4.1 修复：插件商店注入是假就绪（只写声明，不下载引擎包、不重启）——现在注入=声明+下载+校验+运行中自动重启一步到位；启动时所有终端（含 npx/npm/pnpm 外部装法）缺插件商店即自动补装，引擎下载失败不再阻断启动（下次启动自动重试）。"
 }

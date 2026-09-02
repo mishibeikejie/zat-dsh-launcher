@@ -25,7 +25,7 @@ const { planTerminalDeletion } = require('./src/terminal-files')
 const toolchainExec = require('./src/toolchain-execute')
 const cliProbe = require('./src/cli-probe')
 
-const APP_VERSION = '1.4.0'
+const APP_VERSION = '1.4.1'
 
 // ---------------------------------------------------------------------------
 // 白板/交付版隔离：打包版使用按版本隔离的数据目录（%APPDATA%\ZAT-Launcher\v<版本>），
@@ -1272,35 +1272,34 @@ async function startTerminal(terminalId, startOptions = {}) {
     }
   } catch { /* 共享 pnpm 准备失败不阻断启动 */ }
 
-  // 启动前自动检测并补装固定插件商店 zat-dsh-engine：
-  //  - 启动器自管终端（fresh-installed/fresh-empty/cloned）：缺包即自动下载 + 注入声明。
-  //  - 外部终端（scanned/manual）：仅当已声明但包缺失时补装，绝不擅自改外部 profile 声明。
+  // 启动前自动检测并补装固定插件商店 zat-dsh-engine（★ 1.4.1 重做）：
+  //  - 所有终端（含外部接入 npx/npm/pnpm 装法）缺包即自动下载 + 注入声明——
+  //    用户点启动就该有商店。旧实现对外部终端要求"先声明才补装"，官方方式装的
+  //    DSH 永远没有商店、注入按钮也只写声明（假就绪）。
+  //  - 引擎下载/校验失败不再中断启动（DSH 本体不依赖引擎）：警告后继续，下次启动自动重试
   const engineProfileDir = p.profileDir
-  const managedTerminal = ['fresh-installed', 'fresh-empty', 'cloned'].includes(p.terminal && p.terminal.sourceType)
   const engineInfo = engineProfileDir && fs.existsSync(path.join(engineProfileDir, 'package.json'))
     ? engineManager.detectEngine(engineProfileDir)
     : { mounted: false, installedInNodeModules: false }
-  if (managedTerminal || engineInfo.mounted) {
-    if (!engineInfo.installedInNodeModules) {
-      pushTerminalLog(terminalId, 'info', '检测到插件商店 zat-dsh-engine 未实装，自动下载注入…')
-      const engineDir = path.join(engineProfileDir, 'node_modules', 'zat-dsh-engine')
-      // 白板原则：引擎下载的 git 调用走内部工具链（系统无 git 也能装）
-      let engineExecute = null
-      try { engineExecute = makeToolchainExecute((await getToolchainEnv(terminalId)).env) } catch { /* 工具链失败则用系统 git 兜底 */ }
-      const dl = await engineManager.downloadEngineTo(engineDir, (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`), engineExecute)
-      if (!dl.ok) {
-        pushTerminalLog(terminalId, 'error', `插件商店自动下载失败：${dl.message}`)
-        return { ok: false, message: `插件商店自动下载失败：${dl.message}` }
-      }
+  if (!engineInfo.installedInNodeModules) {
+    pushTerminalLog(terminalId, 'info', '检测到插件商店 zat-dsh-engine 未实装，自动下载注入…')
+    const engineDir = path.join(engineProfileDir, 'node_modules', 'zat-dsh-engine')
+    // 白板原则：引擎下载的 git 调用走内部工具链（系统无 git 也能装）
+    let engineExecute = null
+    try { engineExecute = makeToolchainExecute((await getToolchainEnv(terminalId)).env) } catch { /* 工具链失败则用系统 git 兜底 */ }
+    const dl = await engineManager.downloadEngineTo(engineDir, (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`), engineExecute)
+    if (!dl.ok) {
+      pushTerminalLog(terminalId, 'warn', `插件商店自动下载失败（不影响本次启动，下次启动自动重试）：${dl.message}`)
+    } else {
       try { fs.rmSync(path.join(engineDir, '.git'), { recursive: true, force: true }) } catch { /* 忽略 */ }
       engineManager.injectEngine(engineProfileDir)
       const verified = engineManager.verifyEngine(engineProfileDir)
       if (!verified.ok) {
-        pushTerminalLog(terminalId, 'error', `插件商店自动安装校验失败：${verified.message || '包结构或依赖缺失'}`)
-        return { ok: false, message: `插件商店自动安装校验失败：${verified.message || '包结构或依赖缺失'}` }
+        pushTerminalLog(terminalId, 'warn', `插件商店自动安装校验未通过（不影响本次启动，下次启动自动重试）：${verified.message || '包结构或依赖缺失'}`)
+      } else {
+        pushTerminalLog(terminalId, 'info', '插件商店已就绪')
+        emitTerminalSnapshot()
       }
-      pushTerminalLog(terminalId, 'info', '插件商店已自动安装')
-      emitTerminalSnapshot()
     }
   }
 
@@ -2677,17 +2676,35 @@ function registerIpc() {
     const profileDir = path.join(terminal.dshHome || resolveHome(terminal.dshHome), 'profiles', terminal.profileName || 'web')
     return engineManager.checkEngineUpdate(profileDir, engineManager.probeEngineRemoteVersion())
   })
-  ipcMain.handle('engine:inject', (_e, terminalId) => {
+  ipcMain.handle('engine:inject', async (_e, terminalId) => {
     const id = requireTerminalId(terminalId)
     if (!id) return { ok: false, message: '必须指定有效终端' }
     const terminal = terminalRegistry.get(id)
     const profileDir = path.join(terminal.dshHome || resolveHome(terminal.dshHome), 'profiles', terminal.profileName || 'web')
-    const result = engineManager.injectEngine(profileDir)
-    if (result.ok) {
-      emitTerminalSnapshot()
-      auditOp(id, '注入 zat-dsh-engine 引擎')
-    }
-    return result
+    // ★ 1.4.1：注入 = 一件事干到底——写声明 + 下载引擎包 + 校验 + 运行中自动重启。
+    //   旧实现只写声明就报成功（假就绪：包没下载、DSH 没重启，商店永远不会出现）
+    const declared = engineManager.injectEngine(profileDir)
+    if (!declared.ok) return declared
+    const onProgress = (stage, message) => emitInstallProgress({ kind: 'engine', terminalId: id, stage, message, at: Date.now() })
+    const engineDir = path.join(profileDir, 'node_modules', 'zat-dsh-engine')
+    let engineExecute = null
+    try { engineExecute = makeToolchainExecute((await getToolchainEnv(id)).env) } catch { /* 系统 git 兜底 */ }
+    const engine = await engineManager.downloadEngineTo(engineDir, onProgress, engineExecute, { force: fs.existsSync(engineDir) })
+    if (!engine.ok) return { ok: false, message: `引擎下载失败：${engine.message}` }
+    try { fs.rmSync(path.join(engineDir, '.git'), { recursive: true, force: true }) } catch { /* 忽略 */ }
+    const verified = engineManager.verifyEngine(profileDir)
+    if (!verified.ok) return { ok: false, message: `插件商店校验失败：${verified.message || ''}` }
+    auditOp(id, '注入 zat-dsh-engine 引擎')
+    // 运行中：静默重启让引擎立即生效（无感，无需用户再点）
+    try {
+      const runtime = terminalSupervisor.publicRuntime(id)
+      if (runtime.running) {
+        await stopTerminal(id, { confirmAttached: true, silent: true })
+        await startTerminal(id, { autoOpen: false })
+      }
+    } catch { /* 重启失败不改变注入结果（下次启动生效） */ }
+    emitTerminalSnapshot()
+    return { ...declared, message: '插件商店已就绪' }
   })
   ipcMain.handle('engine:rollback', (_e, terminalId) => {
     const id = requireTerminalId(terminalId)
@@ -2721,9 +2738,17 @@ function registerIpc() {
     const verified = engineManager.verifyEngine(profileDir)
     if (!verified.ok) return { ok: false, message: `引擎安装校验失败（${verified.message || '包结构或依赖缺失'}）` }
     const info = engineManager.detectEngine(profileDir)
-    emitTerminalSnapshot()
     auditOp(id, `安装/更新 zat-dsh-engine 到 ${info.installedVersion || '最新'}`)
-    return ok({ mounted: verified.mounted, rootValid: verified.rootValid, installedInNodeModules: verified.installedInNodeModules, installedVersion: info.installedVersion }, `zat-dsh-engine 已更新到 ${info.installedVersion || '最新'}，重启 DSH 后生效`)
+    // ★ 1.4.1：运行中自动重启让引擎立即生效（无感）
+    try {
+      const runtime = terminalSupervisor.publicRuntime(id)
+      if (runtime.running) {
+        await stopTerminal(id, { confirmAttached: true, silent: true })
+        await startTerminal(id, { autoOpen: false })
+      }
+    } catch { /* 重启失败不改变安装结果（下次启动生效） */ }
+    emitTerminalSnapshot()
+    return ok({ mounted: verified.mounted, rootValid: verified.rootValid, installedInNodeModules: verified.installedInNodeModules, installedVersion: info.installedVersion }, '插件商店已就绪')
   })
 
   // ---------------------------------------------------------------------------
