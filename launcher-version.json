@@ -1,5 +1,5 @@
 {
-  "version": "1.4.1",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.1/ZAT-DSH-Launcher-Setup-1.4.1.exe",
-  "notes": "v1.4.1 修复：插件商店注入是假就绪（只写声明，不下载引擎包、不重启）——现在注入=声明+下载+校验+运行中自动重启一步到位；启动时所有终端（含 npx/npm/pnpm 外部装法）缺插件商店即自动补装，引擎下载失败不再阻断启动（下次启动自动重试）。"
+  "version": "1.4.2",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.2/ZAT-DSH-Launcher-Setup-1.4.2.exe",
+  "notes": "v1.4.2 修复：救援诊断新增识别 DSH 更新回滚后的源码/编译产物混装（failed to apply loader entry ... is not a function）；自动恢复 L1 和救援界面新增「重建源码并重启」（clean + 完整 build）。"
 }

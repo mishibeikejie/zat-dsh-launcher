@@ -620,6 +620,12 @@ async function restoreOldVersion(dshDir, oldHead, execute, installAttempts, pnpm
   clearTsBuildInfo(dshDir)
   // ★ 回滚后清理幽灵工作区目录（更新合并时新建、回滚后残留的未跟踪包目录）
   await cleanUntrackedWorkspaceDirs(dshDir, execute, progress)
+  // ★ 必须 clean 全部 lib 编译产物：旧版只清 tsc 缓存，残留的新旧 lib 混装会让
+  //   回滚后的 DSH 启动即崩（ctx.subagents.registerContinuableSetup is not a function 等）。
+  progress('清理全部编译产物…')
+  const cleanOld = await execute(pnpm, ['run', 'clean'], dshDir, 10 * 60 * 1000)
+  if (!cleanOld.ok) return { ok: false, err: `编译产物清理失败：${String(cleanOld.err || cleanOld.out || '').slice(-500)}（${steps.join('、')}）` }
+  steps.push('产物已清理')
   progress('正在重装依赖…')
   let restoreInstall = { ok: false }
   for (const args of installAttempts) {
@@ -711,7 +717,13 @@ async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
     // 增量编译失败/产物缺失：清缓存强制全量编译（旧版可靠路径）
     step('增量编译未满足要求，切换全量编译（清 tsc 缓存，约 2~5 分钟）…')
     clearTsBuildInfo(dshDir)
-    build = await runBuild(dshDir, execute, execute && execute.env || process.env, pnpm, step)
+    step('清理全部编译产物（避免残留 lib 与新源码混装）…')
+    const cleanFull = await execute(pnpm, ['run', 'clean'], dshDir, 10 * 60 * 1000)
+    if (!cleanFull.ok) {
+      build = { ok: false, err: `clean 失败：${String(cleanFull.err || cleanFull.out || '').slice(-500)}` }
+    } else {
+      build = await runBuild(dshDir, execute, execute && execute.env || process.env, pnpm, step)
+    }
     artifact = build.ok ? verifyKeyArtifacts(dshDir, step) : { ok: true }
   }
   if (!install.ok || !build.ok || !artifact.ok) {
@@ -738,4 +750,3 @@ async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
 }
 
 module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli, findHealthyNpmCli, runPnpmDirect, cleanUntrackedWorkspaceDirs }
-
