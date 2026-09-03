@@ -25,7 +25,7 @@ const { planTerminalDeletion } = require('./src/terminal-files')
 const toolchainExec = require('./src/toolchain-execute')
 const cliProbe = require('./src/cli-probe')
 
-const APP_VERSION = '1.4.2'
+const APP_VERSION = '1.4.3'
 
 // ---------------------------------------------------------------------------
 // 白板/交付版隔离：打包版使用按版本隔离的数据目录（%APPDATA%\ZAT-Launcher\v<版本>），
@@ -380,6 +380,20 @@ function currentEnvObj() {
 
 function terminalStorePath() { return path.join(app.getPath('userData'), 'terminals.json') }
 
+// 救援点跨启动器版本共享：按 DSH profile 目录的稳定哈希作为目录名，
+// 不再放进 v<版本> 隔离目录，也不依赖某次启动时随机生成的 terminalId。
+function sharedRescueDir(terminalId) {
+  const base = path.join(app.getPath('appData'), 'ZAT-Launcher', 'rescue')
+  try {
+    if (terminalRegistry && terminalRegistry.get(String(terminalId || ''))) {
+      const profileDir = terminalPaths(String(terminalId)).profileDir
+      const key = crypto.createHash('sha1').update(normalizeDshPath(profileDir)).digest('hex').slice(0, 20)
+      return path.join(base, key)
+    }
+  } catch { /* 读取不到 profile 时退回 terminalId 目录 */ }
+  return path.join(base, String(terminalId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_'))
+}
+
 function migrateEnvironmentsToRegistry() {
   terminalRegistry = new TerminalRegistry(terminalStorePath())
   terminalRegistry.load()
@@ -404,6 +418,47 @@ function migrateEnvironmentsToRegistry() {
   else if (terminalRegistry.selectedTerminalId) currentEnvId = terminalRegistry.selectedTerminalId
 }
 
+// 把历史版本目录（v1.3.1 等）里的救援点迁移到共享位置，目录名按 profileDir 稳定哈希，
+// 保证换启动器版本后仍能看到同一个 DSH 的救援点。
+function migrateRescuePointsFromPreviousVersions() {
+  try {
+    const root = path.join(app.getPath('appData'), 'ZAT-Launcher')
+    const sharedRescueRoot = path.join(root, 'rescue')
+    const currentDir = path.basename(app.getPath('userData'))
+    try { fs.mkdirSync(sharedRescueRoot, { recursive: true }) } catch { /* 目录创建失败则跳过迁移 */ }
+    const versions = fs.readdirSync(root).filter(name => /^v\d+\.\d+\.\d+$/.test(name) && name !== currentDir)
+    versions.sort((a, b) => harnessUpdate.compareVersions(b.slice(1), a.slice(1)))
+    const keyForProfile = (profileDir) => crypto.createHash('sha1').update(normalizeDshPath(profileDir)).digest('hex').slice(0, 20)
+    for (const versionDir of versions) {
+      const oldRescueRoot = path.join(root, versionDir, 'rescue')
+      if (!fs.existsSync(oldRescueRoot)) continue
+      for (const terminalId of fs.readdirSync(oldRescueRoot)) {
+        try {
+          const oldDir = path.join(oldRescueRoot, terminalId)
+          const metaFile = path.join(oldDir, 'snapshot.json')
+          if (!fs.existsSync(metaFile)) continue
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+          const profileDir = String((meta && meta.profileDir) || '')
+          if (!profileDir) continue
+          const targetDir = path.join(sharedRescueRoot, keyForProfile(profileDir))
+          if (fs.existsSync(path.join(targetDir, 'snapshot.json'))) continue
+          fs.mkdirSync(targetDir, { recursive: true })
+          const files = Array.isArray(meta.files) ? meta.files : []
+          for (const rel of files) {
+            const src = path.join(oldDir, rel)
+            if (fs.existsSync(src)) fs.copyFileSync(src, path.join(targetDir, rel))
+          }
+          fs.copyFileSync(metaFile, path.join(targetDir, 'snapshot.json'))
+          const crashSrc = path.join(oldDir, 'last-crash.json')
+          const crashDst = path.join(targetDir, 'last-crash.json')
+          if (fs.existsSync(crashSrc) && !fs.existsSync(crashDst)) fs.copyFileSync(crashSrc, crashDst)
+          pushLog('info', `已迁移救援点：${versionDir} → 共享救援目录（${profileDir}）`)
+        } catch { /* 单个旧救援点迁移失败不影响启动 */ }
+      }
+    }
+  } catch { /* 迁移失败不影响启动 */ }
+}
+
 function supervisorStatusForUi(runtime) {
   return {
     running: runtime.state === 'running' || runtime.state === 'attached-running',
@@ -423,7 +478,7 @@ function supervisorStatusForUi(runtime) {
 }
 
 function terminalRescueStatus(terminalId) {
-  return rescue.rescueStatus(rescue.rescueDirFor(app.getPath('userData'), terminalId))
+  return rescue.rescueStatus(sharedRescueDir(terminalId))
 }
 
 function emitTerminalSnapshot() {
@@ -460,6 +515,7 @@ function loadTerminalLogHistory(terminalId) {
 
 function initializeTerminalSupervisor() {
   migrateEnvironmentsToRegistry()
+  migrateRescuePointsFromPreviousVersions()
   pruneOldLogs()
   // 修正旧版接入记录：外部接入（manual/scanned/attached/filesystem）的 dshHome 应为 DSH 真实 home。
   // 旧版本误存为启动器独立目录，导致 Profile/引擎/会话检测全部落在错误位置。
@@ -500,7 +556,7 @@ function initializeTerminalSupervisor() {
     if (runtime && runtime.state === 'attached-running' && runtime.ownership === 'attached' && !rescueBackedUp.has(terminalId)) {
       rescueBackedUp.add(terminalId)
       try {
-        const rescueDir = rescue.rescueDirFor(app.getPath('userData'), terminalId)
+        const rescueDir = sharedRescueDir(terminalId)
         if (!rescue.rescueStatus(rescueDir).exists) {
           // ★ 1.0.13：快照前校验——profile 的官方 bundle 若未实装(坏状态),把坏状态当"好点"
           //   会让还原救援点救不回;此时跳过快照,留待正常状态再备份。
@@ -885,7 +941,7 @@ function findNodeExe() {
 //   L2 完整恢复：还原救援点 + 强制重装全部官方依赖（配置与依赖一起回到好状态）
 //   L3 工厂重置：备份现有配置 → 重建最小可用 profile（仅官方插件）→ 重装依赖
 async function runAutoFixLevel(terminalId, p, issue, level) {
-  const rescueDir = rescue.rescueDirFor(app.getPath('userData'), terminalId)
+  const rescueDir = sharedRescueDir(terminalId)
   const logStep = (msg) => pushTerminalLog(terminalId, 'info', `[自动恢复 L${level}] ${msg}`)
   try {
     // L1：对症修复（只处理诊断命中的方向）
@@ -1456,7 +1512,7 @@ async function startTerminal(terminalId, startOptions = {}) {
       }
       const diagnosis = rescue.diagnoseCrash(crashLines)
       try {
-        rescue.recordCrash(rescue.rescueDirFor(app.getPath('userData'), terminalId), {
+        rescue.recordCrash(sharedRescueDir(terminalId), {
           exitCode: code,
           profileDir: p.profileDir,
           dshDir: p.dshDir,
@@ -1560,8 +1616,8 @@ async function startTerminal(terminalId, startOptions = {}) {
       // DSH 成功启动 = 一个"好点"：自动更新本终端救援点（快照当前 profile，含所有好插件）。
       // 装坏插件导致启动失败时不会走到这里，救援点仍停在"装坏插件之前"的好状态。
       try {
-        rescue.markCrashRecovered(rescue.rescueDirFor(app.getPath('userData'), terminalId))
-        const rescuePoint = rescue.createRescueSnapshot(p.profileDir, rescue.rescueDirFor(app.getPath('userData'), terminalId))
+        rescue.markCrashRecovered(sharedRescueDir(terminalId))
+        const rescuePoint = rescue.createRescueSnapshot(p.profileDir, sharedRescueDir(terminalId))
         if (rescuePoint.ok) emitTerminalSnapshot()
       } catch { /* 快照失败不阻断就绪结果 */ }
       if (state.settings.autoOpen && startOptions.autoOpen !== false && noOpen) {
@@ -1893,8 +1949,8 @@ async function connectDshDirectory(dshDirInput, sourceType = 'manual', options =
   // 由启动器启动的终端在每次成功启动时自动更新救援点；attached 接入不经过启动流程，这里补上。
   if (attachedNow) {
     try {
-      rescue.markCrashRecovered(rescue.rescueDirFor(app.getPath('userData'), id))
-      const rescuePoint = rescue.createRescueSnapshot(terminalPaths(id).profileDir, rescue.rescueDirFor(app.getPath('userData'), id))
+      rescue.markCrashRecovered(sharedRescueDir(id))
+      const rescuePoint = rescue.createRescueSnapshot(terminalPaths(id).profileDir, sharedRescueDir(id))
       if (rescuePoint.ok) emitTerminalSnapshot()
     } catch { /* 快照失败不阻断接入 */ }
   }
@@ -2054,9 +2110,10 @@ async function envRemove(id) {
 
     // 该终端在启动器 userData 下的全部数据：日志 / 救援点快照 / 更新前快照 / 活动记录，
     // 一起删干净——删除后重建同名端口终端绝不残留旧对话、旧日志、旧快照。
-    for (const sub of ['logs', 'rescue', 'snapshots']) {
+    for (const sub of ['logs', 'snapshots']) {
       try { await fsp.rm(path.join(app.getPath('userData'), sub, id), { recursive: true, force: true }) } catch { /* ignore */ }
     }
+    try { await fsp.rm(sharedRescueDir(id), { recursive: true, force: true }) } catch { /* ignore */ }
     try { await fsp.rm(terminalActivity.activityFileFor(app.getPath('userData'), id), { force: true }) } catch { /* ignore */ }
   } finally {
     sendDeletingState(id, false)
@@ -2817,7 +2874,7 @@ function registerIpc() {
       })
     })
   }
-  const terminalRescueDir = (terminalId) => rescue.rescueDirFor(app.getPath('userData'), terminalId)
+  const terminalRescueDir = (terminalId) => sharedRescueDir(terminalId)
   const terminalProfileDir = (terminalId) => {
     const terminal = terminalRegistry.get(terminalId)
     return path.join(terminal.dshHome || resolveHome(terminal.dshHome), 'profiles', terminal.profileName || 'web')

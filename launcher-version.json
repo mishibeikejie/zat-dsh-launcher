@@ -1,5 +1,5 @@
 {
-  "version": "1.4.2",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.2/ZAT-DSH-Launcher-Setup-1.4.2.exe",
-  "notes": "v1.4.2 修复：救援诊断新增识别 DSH 更新回滚后的源码/编译产物混装（failed to apply loader entry ... is not a function）；自动恢复 L1 和救援界面新增「重建源码并重启」（clean + 完整 build）。"
+  "version": "1.4.3",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.3/ZAT-DSH-Launcher-Setup-1.4.3.exe",
+  "notes": "v1.4.3 修复：救援点改为跨启动器版本共享（%APPDATA%\\ZAT-Launcher\\rescue，按 DSH profile 目录稳定哈希），升级版本后仍能读取旧版本创建的救援点，并自动迁移历史救援点。"
 }
