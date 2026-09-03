@@ -11,7 +11,7 @@ const els = {
   envSwitch: $('env-switch'), envSwitchValue: $('env-switch-value'), envMenu: $('env-menu'), addTerminal: $('btn-add-terminal'), removeTerminal: $('btn-remove-terminal'), harnessVersion: $('harness-version'), harnessUpdateBadge: $('harness-update-badge'), harnessUpdateDetail: $('harness-update-detail'), checkUpdate: $('btn-check-update'), installUpdate: $('btn-install-update'), checkEnv: $('btn-check-env'), repairEnv: $('btn-repair-env'), chooseDsh: $('btn-choose-dsh'), envGrid: $('env-grid'), envPath: $('env-dsh-path'),
   engineStatus: $('engine-status'), engineStatusDetail: $('engine-status-detail'), engineInject: $('btn-engine-inject'), engineRollback: $('btn-engine-rollback'), engineCheck: $('btn-engine-check'), engineUpdateBadge: $('engine-update-badge'),
   launcherVersion: $('launcher-version'), launcherUpdateBadge: $('launcher-update-badge'), launcherUpdateDetail: $('launcher-update-detail'), launcherCheckUpdate: $('btn-launcher-check-update'),
-  rescueStatus: $('rescue-status'), rescueStatusDetail: $('rescue-status-detail'), rescueCreate: $('btn-rescue-create'), rescueDiagnose: $('btn-rescue-diagnose'), rescueCopyLog: $('btn-rescue-copy-log'), rescueDiagnoseDetail: $('rescue-diagnose-detail'), rescueIssues: $('rescue-issues'),
+  rescueStatus: $('rescue-status'), rescueStatusDetail: $('rescue-status-detail'), rescueCreate: $('btn-rescue-create'), rescueRestore: $('btn-rescue-restore'), rescueDiagnose: $('btn-rescue-diagnose'), rescueCopyLog: $('btn-rescue-copy-log'), rescueDiagnoseDetail: $('rescue-diagnose-detail'), rescueIssues: $('rescue-issues'),
   emptyInstall: $('empty-install'), emptyScan: $('empty-scan'), emptyManual: $('empty-manual'), emptyDesc: $('empty-desc'),
   toasts: $('toasts'), modal: $('modal-mask'), modalTitle: $('modal-title'), modalMessage: $('modal-message'), modalOk: $('modal-ok'), modalCancel: $('modal-cancel'),
   wizard: $('wizard-mask'), wizardTitle: $('wizard-title'), wizardBody: $('wizard-body'), wizardClose: $('wizard-close'), wizardBack: $('wizard-back'),
@@ -422,6 +422,10 @@ function renderRescueStatus(info) {  if (!els.rescueStatus || !els.rescueStatusD
   els.rescueStatus.classList.toggle('store-mounted', exists)
   els.rescueStatus.classList.toggle('store-missing', !exists)
   els.rescueStatus.textContent = exists ? '有救援点' : '无救援点'
+  if (els.rescueRestore) {
+    els.rescueRestore.hidden = !exists
+    els.rescueRestore.disabled = false
+  }
   if (exists) {
     const d = new Date(info.at)
     const base = `救援点时间 ${isNaN(d.getTime()) ? '未知' : d.toLocaleString('zh-CN', { hour12: false })}（${(info.files || []).length} 个文件）`
@@ -953,6 +957,20 @@ async function init() {
     const r = await api.rescueCreate(id)
     toast(r.message, r.ok ? '' : 'error')
     if (r.ok && state.selectedTerminalId === id && seqAtClick === selectionSeq) renderRescueStatus(await api.rescueStatus(id))
+  }
+  if (els.rescueRestore) els.rescueRestore.onclick = async () => {
+    const id = state.selectedTerminalId
+    if (!id) return toast('请先选择终端', 'error')
+    if (!await confirm('还原救援点', '将把当前终端 profile 配置还原到救援点（上次成功启动的状态），并重启 DSH 生效。确定继续？')) return
+    const seqAtClick = selectionSeq
+    els.rescueRestore.disabled = true
+    try {
+      const r = await api.rescueRestore(id)
+      toast(r.message, r.ok ? '' : 'error')
+      if (r.ok && state.selectedTerminalId === id && seqAtClick === selectionSeq) renderRescueStatus(await api.rescueStatus(id))
+    } finally {
+      if (els.rescueRestore) els.rescueRestore.disabled = false
+    }
   }
   if (els.rescueDiagnose) els.rescueDiagnose.onclick = async () => {
     const id = state.selectedTerminalId

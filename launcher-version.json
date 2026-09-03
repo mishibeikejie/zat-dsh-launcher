@@ -1,5 +1,5 @@
 {
   "version": "1.4.3",
   "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.3/ZAT-DSH-Launcher-Setup-1.4.3.exe",
-  "notes": "v1.4.3 修复：救援点改为跨启动器版本共享（%APPDATA%\\ZAT-Launcher\\rescue，按 DSH profile 目录稳定哈希），升级版本后仍能读取旧版本创建的救援点，并自动迁移历史救援点。"
+  "notes": "v1.4.3 修复：救援点改为跨启动器版本共享并自动迁移历史救援点；救援页有救援点时显示独立「还原救援点」按钮，可手动一键还原。"
 }
