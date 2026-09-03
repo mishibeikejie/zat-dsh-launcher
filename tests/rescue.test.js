@@ -160,6 +160,16 @@ test('diagnoseCrash detects bundle-mismatch from ToolRuntime prepare crash (#167
   assert.equal(issues[0].fix, 'reinstall')
 })
 
+test('diagnoseCrash detects source-mixed rollback (loader entry is not a function)', () => {
+  const logs = [
+    'Error: dsh: plugin tree failed to load: failed to apply loader entry tool-subagent-report (@deepseek-ai/dsh-tool-subagent-report): ctx.subagents.registerContinuableSetup is not a function',
+  ]
+  const r = diagnoseCrash(logs)
+  const issues = r.issues.filter(i => i.type === 'source-mixed')
+  assert.equal(issues.length, 1, `应识别出 source-mixed: ${JSON.stringify(r.issues)}`)
+  assert.equal(issues[0].fix, 'rebuild-source')
+})
+
 test('diagnoseCrash detects duplicate loader entry (插件市场装插件后崩溃 #3263/#2889)', () => {
   const logs = [
     'Error: duplicate loader entry id: storage (already registered by another plugin)',

@@ -909,6 +909,24 @@ async function runAutoFixLevel(terminalId, p, issue, level) {
         if (r.ok) { logStep('profile 依赖已重装（与主包版本匹配）'); return true }
         logStep(`重装失败：${r.message}`); return false
       }
+      if (issue.type === 'source-mixed') {
+        logStep('清理并重建 DSH 源码（clean + build，约 1-5 分钟）…')
+        try {
+          const tcEnv = await getToolchainEnv(terminalId)
+          const nodeExe = tcEnv.nodeExe || findNodeExe()
+          const pnpm = freshInstall.executablePnpm(tcEnv.pnpmExe || freshInstall.findPnpm(), nodeExe)
+          if (!pnpm) { logStep('未找到 pnpm，无法重建源码'); return false }
+          const exec = makeToolchainExecute(tcEnv.env)
+          const clean = await exec('重建源码', pnpm, ['run', 'clean'], p.dshDir, (stage, msg) => pushTerminalLog(terminalId, 'info', `[自动恢复 L1] [${stage}] ${msg}`), 10 * 60 * 1000)
+          if (!clean.ok) { logStep(`清理编译产物失败：${String(clean.err || clean.out || '').slice(-300)}`); return false }
+          const build = await exec('重建源码', pnpm, ['run', 'build'], p.dshDir, (stage, msg) => pushTerminalLog(terminalId, 'info', `[自动恢复 L1] [${stage}] ${msg}`), 40 * 60 * 1000)
+          if (!build.ok) { logStep(`源码重建失败：${String(build.err || build.out || '').slice(-500)}`); return false }
+          logStep('DSH 源码重建完成')
+          return true
+        } catch (e) {
+          logStep(`重建异常：${friendlyError(e)}`); return false
+        }
+      }
       if ((issue.type === 'missing-bundle' || issue.type === 'plugin-failed' || issue.type === 'duplicate-plugin' || issue.type === 'missing-module') && issue.plugin) {
         const r = rescue.excludePlugin(p.profileDir, issue.plugin)
         if (r.ok) { logStep(`已排除插件「${issue.plugin}」（保留其它插件）`); return true }
@@ -2942,6 +2960,30 @@ function registerIpc() {
 
   // 源码形态缺 devDependency（如 tsx）：对 dshDir 跑 pnpm install，装完自动重启。
   // 与 bundle reinstall（profile 级）不同，这是源码树级依赖（克隆后未安装的典型场景）。
+  // DSH 更新回滚后的源码/产物混装：git 已回到旧提交，但 packages/**/lib 还是新旧混合。
+  // 救援点（profile 配置）救不了这种，必须 clean 全部编译产物后完整重建。
+  ipcMain.handle('rescue:rebuild-source', async (_e, terminalId) => {
+    const id = requireTerminalId(terminalId)
+    if (!id) return { ok: false, message: '必须指定有效终端' }
+    const p = terminalPaths(id)
+    pushTerminalLog(id, 'info', '检测到 DSH 源码/产物混装：开始 clean + 完整重建…')
+    auditOp(id, '重建 DSH 源码（clean + build）')
+    const tcEnv = await getToolchainEnv(id)
+    const nodeExe = tcEnv.nodeExe || findNodeExe()
+    const pnpm = freshInstall.executablePnpm(tcEnv.pnpmExe || freshInstall.findPnpm(), nodeExe)
+    if (!pnpm) return { ok: false, message: '未找到 pnpm，无法重建源码' }
+    const runtime = terminalSupervisor.get(id)
+    if (runtime.running || runtime.state === 'attached-running') await stopTerminal(id, { confirmAttached: true })
+    const exec = makeToolchainExecute(tcEnv.env)
+    const progress = (stage, message) => pushTerminalLog(id, 'info', `[${stage}] ${message}`)
+    const clean = await exec('重建源码', pnpm, ['run', 'clean'], p.dshDir, progress, 10 * 60 * 1000)
+    if (!clean.ok) return { ok: false, message: `清理编译产物失败：${String(clean.err || clean.out || '').slice(-300)}` }
+    const build = await exec('重建源码', pnpm, ['run', 'build'], p.dshDir, progress, 40 * 60 * 1000)
+    if (!build.ok) return { ok: false, message: `源码重建失败：${String(build.err || build.out || '').slice(-500)}` }
+    pushTerminalLog(id, 'info', 'DSH 源码重建完成，准备重启…')
+    const start = await startTerminal(id)
+    return ok({}, start.ok ? 'DSH 源码已重建并启动' : `DSH 源码已重建，但重启失败：${start.message}`)
+  })
   ipcMain.handle('rescue:install-source-deps', async (_e, terminalId) => {
     const id = requireTerminalId(terminalId)
     if (!id) return { ok: false, message: '必须指定有效终端' }

@@ -50,6 +50,7 @@ const api = {
   rescueDiagnose: (terminalId) => ipcRenderer.invoke('rescue:diagnose', terminalId),
   rescueExclude: (terminalId, pluginName) => ipcRenderer.invoke('rescue:exclude', terminalId, pluginName),
   rescueReinstallBundles: (terminalId) => ipcRenderer.invoke('rescue:reinstall-bundles', terminalId),
+  rescueRebuildSource: (terminalId) => ipcRenderer.invoke('rescue:rebuild-source', terminalId),
   rescueInstallSourceDeps: (terminalId) => ipcRenderer.invoke('rescue:install-source-deps', terminalId),
   harnessInfo: (terminalId) => ipcRenderer.invoke('harness:info', terminalId),
   harnessCheckUpdate: (terminalId) => ipcRenderer.invoke('harness:check-update', terminalId),

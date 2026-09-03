@@ -648,6 +648,23 @@ function renderRescueDiagnosis(result) {
         if (r.ok) { renderRescueStatus(await api.rescueStatus(id)); renderRescueDiagnosis(await api.rescueDiagnose(id)) }
       }
       actions.appendChild(btn)
+    } else if (issue.fix === 'rebuild-source') {
+      // DSH 更新回滚后源码/编译产物混装：只重装 profile 依赖救不了，必须 clean + 完整重建源码。
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'btn btn-primary btn-mini'
+      btn.textContent = '重建源码并重启'
+      btn.onclick = async () => {
+        btn.disabled = true
+        btn.textContent = '重建中（约几分钟）…'
+        const id = state.selectedTerminalId
+        const r = await api.rescueRebuildSource(id)
+        toast(r.message, r.ok ? '' : 'error')
+        btn.disabled = false
+        btn.textContent = '重建源码并重启'
+        if (r.ok) { renderRescueStatus(await api.rescueStatus(id)); renderRescueDiagnosis(await api.rescueDiagnose(id)) }
+      }
+      actions.appendChild(btn)
     }
     row.appendChild(actions)
     els.rescueIssues.appendChild(row)

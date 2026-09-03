@@ -152,6 +152,13 @@ function diagnoseCrash(logLines) {
       add('bundle-mismatch', '', 'profile 插件加载失败（版本不匹配）：bundle 引用了主包不存在的模块，需要重新安装 profile 依赖后重启', 'reinstall')
       continue
     }
+    // DSH 更新失败回滚后最常见的崩法：git 只回滚源码，packages/**/lib 编译产物与依赖新旧混装，
+    // 启动时 plugin tree 报 xxx is not a function（如 ctx.subagents.registerContinuableSetup）。
+    // 救援点只有 profile 配置文件，救不了源码目录，必须 clean + 完整重建。
+    if (/plugin tree failed to load|failed to apply loader entry/i.test(text) && /is not a function/i.test(text)) {
+      add('source-mixed', '', 'DSH 更新回滚后源码与编译产物混装（loader 调用不存在的函数）：需要清理全部编译产物并重建源码后重启', 'rebuild-source')
+      continue
+    }
     // 工具调度器未注册（#1677/#2130）：根因多为重复安装的 @deepseek-ai/* 依赖拷贝，
     // 与 bundle 错配同类，同样需要重装 profile 依赖。
     m = text.match(/Cannot read properties of undefined \(reading ['"]([^'"]+)['"]\)/i)
