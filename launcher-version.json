@@ -1,5 +1,5 @@
 {
-  "version": "1.5.1",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.1/ZAT-DSH-Launcher-Setup-1.5.1.exe",
-  "notes": "v1.5.1：pnpm 安装失败根治（矩阵实测：官方 dist/pnpm.mjs 用 node 跑 worker 在 Windows 稳定崩溃 ×5 组合；官方 standalone 二进制 11.22/11.25 均真实安装成功）——主路径改为官方 standalone（下载 zip 解压+体检，仅白名单已验证版本）；内置工具全量升最新（pnpm 11.25.0 / npm 12.0.2 / node 24.20.0 LTS / git 2.55.0）并实现在线跟随上游；版本基准以 DSH 仓库发布日为准（npm 未同步不再谎报\"已是最新\"）；alpha 标签纳入探测。"
+  "version": "1.5.2",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.2/ZAT-DSH-Launcher-Setup-1.5.2.exe",
+  "notes": "v1.5.2 修正版：① 版本号真同步——v1.5.0/v1.5.1 的 main.js 版本漏改停在 1.4.3（UI 徽章/数据目录全显旧版），本次版本号改为单一事实源（只维护 package.json），UI 与数据目录自动跟随；② 新版本数据目录自动继承上一版本终端/配置，升级不再丢终端列表；③ 黑窗根治——隐藏控制台启动遇裸程序名（node）时 C# CreateProcess 不做 PATH 搜索导致退回普通启动、子进程呼呼弹黑窗，现统一先解析为绝对路径；④ 内置工具全最新：pnpm 11.25.0 / npm 12.0.2 / node 24.20.0 LTS / git 2.55.0，安装主路径官方 standalone pnpm（白名单已实测版本），在线跟随上游。"
 }

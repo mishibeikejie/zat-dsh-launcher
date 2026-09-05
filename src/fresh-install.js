@@ -1128,8 +1128,25 @@ async function ensureConsoleHostDll(execute = run) {
  * 其子进程继承同一隐藏控制台 → 不再弹窗；stdout/stderr 通过继承的管道句柄直达调用方。
  * 失败时返回普通 spawn 结果（保底可用）。
  */
+// ★ 1.5.2（黑窗根治）：C# CreateProcess 的 lpApplicationName 传非空且不带路径的
+//   "裸程序名"（如 findNodeExe 兜底返回的 'node'）时【不做 PATH 搜索】→ Launch 必失败
+//   （8 秒超时）→ 退回普通启动 → DSH 及子进程全无隐藏控制台 → 呼呼弹黑窗。
+//   这里统一先把裸程序名解析成绝对路径；Node spawn 自己会搜 PATH，但 C# 不搜。
+async function resolveProgramAbsolutePath(program) {
+  if (!program || typeof program !== 'string') return program
+  if (path.isAbsolute(program) || program.includes('/') || program.includes('\\')) return program
+  try {
+    const where = require('node:child_process').execFileSync('where.exe', [program], {
+      stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 8000, windowsHide: true,
+    })
+    const first = String(where).split(/\r?\n/).map(s => s.trim()).find(Boolean)
+    if (first && fs.existsSync(first)) return first
+  } catch { /* 解析失败则原样返回，由调用方兜底 */ }
+  return program
+}
 async function spawnWithHiddenConsole(program, args, options = {}) {
   const { cwd, env, stdio = ['ignore', 'pipe', 'pipe'], detached = true } = options
+  program = await resolveProgramAbsolutePath(program)
   const dll = await ensureConsoleHostDll()
   if (dll) {
     try {

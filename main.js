@@ -25,7 +25,12 @@ const { planTerminalDeletion } = require('./src/terminal-files')
 const toolchainExec = require('./src/toolchain-execute')
 const cliProbe = require('./src/cli-probe')
 
-const APP_VERSION = '1.4.3'
+// ★ 1.5.2：版本号单一事实源 = package.json。历史发版多次只改 package.json/launcher-version.json
+//   忘改这里（v1.5.0/v1.5.1 都停在 '1.4.3'）→ UI 徽章/userData 目录全显示旧版，用户以为没更新。
+const APP_VERSION = (() => {
+  try { return String(require('./package.json').version || '') } catch { /* 读取失败走兜底 */ }
+  return '1.5.2'
+})()
 
 // ---------------------------------------------------------------------------
 // 白板/交付版隔离：打包版使用按版本隔离的数据目录（%APPDATA%\ZAT-Launcher\v<版本>），
@@ -38,6 +43,42 @@ if (app.isPackaged) {
   try {
     app.setPath('userData', path.join(app.getPath('appData'), 'ZAT-Launcher', `v${APP_VERSION}`))
   } catch { /* 设置失败则退回默认目录 */ }
+}
+if (app.isPackaged) {
+  try { inheritUserDataFromPreviousVersion() } catch { /* 继承失败不影响启动 */ }
+}
+
+// ★ 1.5.2：跨版本继承用户数据。版本目录按 v<version> 隔离——若升级后落到全新目录
+//   （如 v1.5.0/v1.5.1 的 APP_VERSION 实际停在 1.4.3，用户数据全在 v1.4.3；修正版升到
+//   真 v1.5.2 后目录会变），终端注册表/配置/会话记忆会"消失"→ 用户以为更新把数据清了。
+//   处理：新目录缺关键文件时，从【版本号最大的旧目录】复制（只补缺失，绝不覆盖现数据）。
+function inheritUserDataFromPreviousVersion() {
+  try {
+    const root = path.join(app.getPath('appData'), 'ZAT-Launcher')
+    const current = path.basename(app.getPath('userData'))
+    if (!/^v\d+\.\d+\.\d+$/.test(current)) return
+    let bestDir = ''
+    for (const name of fs.readdirSync(root)) {
+      if (!/^v\d+\.\d+\.\d+$/.test(name) || name === current) continue
+      const cmp = compareVersionsSafe(name.slice(1), current.slice(1))
+      if (cmp >= 0) continue // 只从旧版本继承，绝不反向/同版本
+      if (!bestDir || compareVersionsSafe(name.slice(1), bestDir.slice(1)) > 0) bestDir = name
+    }
+    if (!bestDir) return
+    const src = path.join(root, bestDir)
+    const dst = app.getPath('userData')
+    fs.mkdirSync(dst, { recursive: true })
+    for (const file of ['config.json', 'terminals.json', 'session-seen.json']) {
+      const from = path.join(src, file)
+      const to = path.join(dst, file)
+      if (fs.existsSync(from) && !fs.existsSync(to)) {
+        try { fs.copyFileSync(from, to); pushLog('info', `已从 ${bestDir} 继承 ${file}（新版本目录初始化）`) } catch { /* 单个文件失败继续 */ }
+      }
+    }
+  } catch { /* 继承失败不影响启动 */ }
+}
+function compareVersionsSafe(a, b) {
+  try { return require('./src/harness-update').compareVersions(a, b) } catch { return a.localeCompare(b) }
 }
 
 // 单实例锁：双击/重复打开只保留一个实例，第二个实例唤醒第一个（防注册表并发写坏）
@@ -924,7 +965,17 @@ function findNodeExe() {
       if (c === 'node') {
         // 只有真实能跑且版本满足 DSH 要求的 node 才算数（DSH engines: ^22.19.0 || >=24.0.0）
         const r = require('node:child_process').execFileSync('node', ['-v'], { stdio: 'pipe', timeout: 5000 })
-        if (r && nodeSatisfiesDsh(String(r))) return 'node'
+        if (r && nodeSatisfiesDsh(String(r))) {
+          // ★ 1.5.2：能跑还不够——必须解析成【绝对路径】再返回。裸 'node' 有两个坑：
+          //   ① C# CreateProcess 不做 PATH 搜索 → 隐藏控制台 Launch 必失败 → 退回普通启动 → 弹黑窗
+          //   ② path.dirname('node')='.' → 工具链 PATH 注入 '.' 而不是 node 目录，DSH 子进程找错 node
+          try {
+            const whereOut = require('node:child_process').execFileSync('where.exe', ['node'], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 5000, windowsHide: true })
+            const first = String(whereOut).split(/\r?\n/).map(s => s.trim()).find(s => /node(\.exe)?$/i.test(s))
+            if (first && fs.existsSync(first)) return first
+          } catch { /* where 失败则退回裸名（Node spawn 仍可解析） */ }
+          return 'node'
+        }
       } else if (fs.existsSync(c)) {
         try {
           const r = require('node:child_process').execFileSync(c, ['-v'], { stdio: 'pipe', timeout: 5000 })
