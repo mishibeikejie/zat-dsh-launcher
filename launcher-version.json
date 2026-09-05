@@ -1,5 +1,5 @@
 {
-  "version": "1.4.3",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.4.3/ZAT-DSH-Launcher-Setup-1.4.3.exe",
-  "notes": "v1.4.3 修复：救援点改为跨启动器版本共享并自动迁移历史救援点；救援页有救援点时显示独立「还原救援点」按钮，可手动一键还原。"
+  "version": "1.5.0",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.0/ZAT-DSH-Launcher-Setup-1.5.0.exe",
+  "notes": "v1.5.0：内置工具全部升级到最新并实现在线自升级——pnpm 11.7.0→11.25.0（修复 DSH 新版依赖树安装 worker 崩溃，实测复现）；npm 11.3.0→12.0.2；Node v22.19.0→v24.20.0 LTS；PortableGit 2.47.1→2.55.0。版本基准修正：以 DSH 开源仓库发布日（GitHub Releases）为最新版判据，npm 未同步时不再谎报\"已是最新\"；npm dist-tags 的 alpha 标签纳入。"
 }

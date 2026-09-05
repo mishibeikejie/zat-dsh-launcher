@@ -143,6 +143,34 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run }) {
   const dir = (() => { try { fs.mkdirSync(rawDir, { recursive: true }); return fs.realpathSync(rawDir) } catch { return normalToolsDir() + '\\zat-tools' } })()
   const cached = path.join(dir, 'pnpm.mjs')
   const nodeBin = nodeExe && nodeExe !== 'pnpm' ? nodeExe : 'node'
+  // ★ 1.4.2 根修：在线跟随 pnpm@latest（内置仅兜底）——registry 比内置新 → 下载官方单文件
+  //   （sha512 校验）→ 体检 → 用之；任何失败静默回退内置。pnpm 未来再更新永不依赖发版。
+  try {
+    const latestVer = await probeRegistryPnpmLatest(nodeBin, dir)
+    if (latestVer) {
+      const builtinVer = await builtinPnpmVersion(nodeBin, dir)
+      if (builtinVer && latestVer !== builtinVer) {
+        const upgraded = path.join(dir, `pnpm-${latestVer}.mjs`)
+        if (fs.existsSync(upgraded)) {
+          const r = await run(nodeBin, [upgraded, '--version'], null, 15000)
+          if (r.ok && String(r.out || '').trim() === latestVer) {
+            if (onProgress) onProgress('依赖', `已启用最新 pnpm ${latestVer}`)
+            return upgraded
+          }
+          try { fs.rmSync(upgraded, { force: true }) } catch { /* 忽略 */ }
+        }
+        const dl = await downloadPnpmDist(nodeBin, latestVer, dir, onProgress)
+        if (dl) return dl
+        // 下载/校验失败：静默回退内置（不阻塞安装）
+      }
+    }
+  } catch { /* 在线探测失败回退内置 */ }
+  // 内置资产（asarUnpack 物理文件）；★ 1.4.2：大小幂等比较——缓存与资产不一致（版本升级/损坏）
+  // 一律重拷。老用户手里的旧版 pnpm.mjs（撞新依赖链 worker 崩溃：实测 11.7.0 崩 / 11.25.0 成）
+  // 自动被升级，无需手删。
+  const src = path.join(__dirname, '..', 'assets', 'pnpm.cjs')
+  let srcSize = -1
+  try { srcSize = fs.statSync(src).size } catch { /* 资产缺失走 findPnpm 兜底 */ }
   // ★ 1.4.0：缓存命中先体检（node pnpm.mjs --version）——损坏的 pnpm.mjs 被永久信任会让
   //   所有安装/更新报语法错误且永不自愈（同 npmCliHealthy/probeGit 的体检惯例）
   const healthy = async () => {
@@ -152,16 +180,17 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run }) {
     } catch { return false }
   }
   if (fs.existsSync(cached)) {
-    if (await healthy()) return cached
-    if (onProgress) onProgress('依赖', '自举 pnpm 缓存自检失败，重新复制…')
+    let sizeOk = true
+    if (srcSize > 0) { try { sizeOk = fs.statSync(cached).size === srcSize } catch { sizeOk = false } }
+    if (sizeOk && await healthy()) return cached
+    if (onProgress) onProgress('依赖', '自举 pnpm 缓存与内置版本不一致/自检失败，正在刷新…')
     try { fs.rmSync(cached, { force: true }) } catch { /* 忽略 */ }
   }
   const existing = findPnpm()
-  if (existing) return existing
+  if (existing && srcSize <= 0) return existing
   // 内置 pnpm（assets/pnpm.cjs = 官方 dist/pnpm.mjs 单文件）：直接复制，零下载零安装。
   // asarUnpack 后 Electron 会把 asar 路径透明映射到 resources/app.asar.unpacked 物理文件，
   // 但显式探测物理路径更稳（打包机/便携版路径不同）。复制失败 = 安装包异常，如实抛出。
-  const src = path.join(__dirname, '..', 'assets', 'pnpm.cjs')
   // ★ 1.4.0：tmp + rename 原子落盘——两个进程并发冷启动（便携版换 userData 可双开）
   //   直接 copyFileSync 到目标会互相截断，产出损坏的 pnpm.mjs
   const tmp = `${cached}.${process.pid}.tmp`
@@ -183,12 +212,198 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run }) {
   return cached
 }
 
+// ★ 1.4.2 根修：pnpm 在线自升级——内置版本永远可能落后（曾实测内置 11.7.0 撞新依赖链
+//   worker 崩溃 / 11.22.0 成功）。根本解法 = 以 npm registry 的 pnpm@latest 为跟随目标：
+//   每次工具链准备时探测（3 秒超时，6 小时 TTL），比内置新 → 下载官方单文件（sha512
+//   完整性对 registry 元数据校验）→ 体检版本 === 目标 → 使用；任何失败静默回退内置。
+//   未来 pnpm 再更新/修 bug，用户下次安装自动用上，永不依赖启动器发版。
+const PNPM_LATEST_CACHE_NAME = 'pnpm-latest.json'
+const PNPM_LATEST_TTL_MS = 6 * 60 * 60 * 1000
+
+function probeRegistryPnpmLatest(nodeBin, toolsDir, timeoutMs = 3000) {
+  const cacheFile = path.join(toolsDir || path.join(normalToolsDir(), 'zat-tools'), PNPM_LATEST_CACHE_NAME)
+  try {
+    const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
+    if (cached && cached.ver && Date.now() - Number(cached.at || 0) < PNPM_LATEST_TTL_MS) return Promise.resolve(String(cached.ver))
+  } catch { /* 无缓存或损坏 */ }
+  return new Promise(resolve => {
+    const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>console.log(j.latest||"")).catch(()=>process.exit(1))'
+    run(nodeBin, ['-e', script, 'https://registry.npmjs.org/-/package/pnpm/dist-tags'], null, timeoutMs).then(r => {
+      const ver = (r.ok && r.out || '').trim()
+      if (!/^\d+\.\d+\.\d+/.test(ver)) return resolve('')
+      try {
+        fs.mkdirSync(path.dirname(cacheFile), { recursive: true })
+        fs.writeFileSync(cacheFile, JSON.stringify({ ver, at: Date.now() }), 'utf8')
+      } catch { /* 缓存失败不阻断 */ }
+      resolve(ver)
+    }).catch(() => resolve(''))
+  })
+}
+
+function verifySha512(file, integrity) {
+  try {
+    const m = /^sha512-([A-Za-z0-9+/=]+)$/.exec(String(integrity || ''))
+    if (!m) return false
+    const digest = require('node:crypto').createHash('sha512').update(fs.readFileSync(file)).digest('base64')
+    return digest === m[1]
+  } catch { return false }
+}
+
+// 下载官方 pnpm 单文件 dist/pnpm.mjs：registry 元数据（含 sha512 integrity）→ 下载 tgz →
+// 校验 → 解压取 dist/pnpm.mjs → 原子落盘 <dir>/pnpm-<version>.mjs → 体检版本 === 目标。
+function downloadPnpmDist(nodeBin, version, dir, onProgress = null) {
+  const pkgRoot = `https://registry.npmjs.org/pnpm`
+  return new Promise(resolve => {
+    if (!/^\d+\.\d+\.\d+/.test(String(version || ''))) return resolve('')
+    fs.mkdirSync(dir, { recursive: true })
+    const metaUrl = `${pkgRoot}/${version}`
+    run(nodeBin, ['-e', 'fetch(process.argv[1]).then(r=>r.json()).then(j=>console.log(j.dist&&j.dist.tarball||"")).catch(()=>process.exit(1))', metaUrl], null, 5000).then(metaR => {
+      const tarball = (metaR.ok && metaR.out || '').trim()
+      const integrityUrl = `${pkgRoot}/-/pnpm-${version}.tgz`
+      if (!tarball) return resolve('')
+      // integrity 与 tgz 一并取：npmjs 元数据带 dist.integrity；npmmirror 兼容
+      run(nodeBin, ['-e', 'fetch(process.argv[1]).then(r=>r.json()).then(j=>console.log(j.dist&&j.dist.integrity||"")).catch(()=>process.exit(1))', metaUrl], null, 5000).then(metaR2 => {
+        const integrity = (metaR2.ok && metaR2.out || '').trim()
+        const tgz = path.join(dir, `pnpm-${version}.tgz`)
+        const extract = path.join(dir, `pnpm-${version}.extract`)
+        const final = path.join(dir, `pnpm-${version}.mjs`)
+        const cleanup = () => {
+          try { fs.rmSync(tgz, { force: true }) } catch { /* 忽略 */ }
+          try { fs.rmSync(extract, { recursive: true, force: true }) } catch { /* 忽略 */ }
+        }
+        downloadFileNative(tarball, tgz, onProgress, 120000).then(r => {
+          if (!r.ok || !fs.existsSync(tgz) || fs.statSync(tgz).size < 1000000) { cleanup(); return resolve('') }
+          if (integrity && !verifySha512(tgz, integrity)) {
+            if (onProgress) onProgress('依赖', 'pnpm 下载完整性校验失败，已丢弃')
+            cleanup(); return resolve('')
+          }
+          try { fs.rmSync(extract, { recursive: true, force: true }) } catch { /* 忽略 */ }
+          fs.mkdirSync(extract, { recursive: true })
+          run('tar.exe', ['-xzf', tgz, '-C', extract], dir, 120000).then(extR => {
+            if (!extR.ok) { cleanup(); return resolve('') }
+            // pnpm 发布结构：dist/pnpm.mjs（单文件）；兼容旧结构 bin/pnpm.cjs
+            const candidates = [
+              path.join(extract, 'package', 'dist', 'pnpm.mjs'),
+              path.join(extract, 'package', 'dist', 'pnpm.cjs'),
+              path.join(extract, 'package', 'bin', 'pnpm.cjs'),
+            ]
+            const found = candidates.find(p => fs.existsSync(p) && fs.statSync(p).size > 5000000)
+            if (!found) { cleanup(); return resolve('') }
+            const tmp = `${final}.${process.pid}.tmp`
+            try {
+              fs.copyFileSync(found, tmp)
+              fs.renameSync(tmp, final)
+            } catch {
+              try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
+              return resolve('')
+            }
+            cleanup()
+            run(nodeBin, [final, '--version'], null, 15000).then(v => {
+              if (v.ok && String(v.out || '').trim() === version) {
+                if (onProgress) onProgress('依赖', `已启用最新 pnpm ${version}`)
+                resolve(final)
+              } else resolve('')
+            }).catch(() => resolve(''))
+          }).catch(() => { cleanup(); resolve('') })
+        }).catch(() => { cleanup(); resolve('') })
+      }).catch(() => resolve(''))
+    }).catch(() => resolve(''))
+  })
+}
+
+// ★ 内置资产版本（缓存文件避免每次跑 12MB 脚本；TTL 6 小时）
+function builtinPnpmVersion(nodeBin, dir) {
+  const cacheFile = path.join(dir, 'pnpm-builtin.json')
+  try {
+    const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
+    if (cached && cached.ver && Date.now() - Number(cached.at || 0) < PNPM_LATEST_TTL_MS) return Promise.resolve(String(cached.ver))
+  } catch { /* 无缓存 */ }
+  const src = path.join(__dirname, '..', 'assets', 'pnpm.cjs')
+  if (!fs.existsSync(src)) return Promise.resolve('')
+  return new Promise(resolve => {
+    run(nodeBin, [src, '--version'], null, 20000).then(r => {
+      const ver = (r.ok && r.out || '').trim()
+      if (!/^\d+\.\d+\.\d+/.test(ver)) return resolve('')
+      try { fs.writeFileSync(cacheFile, JSON.stringify({ ver, at: Date.now() }), 'utf8') } catch { /* 忽略 */ }
+      resolve(ver)
+    }).catch(() => resolve(''))
+  })
+}
+
+// ★ 1.4.2 统一：内置版本仅兜底，实际安装跟随上游最新（TTL 缓存 6h，失败回退内置）。
+//   背景：内置 pnpm/npm/node/git 全部打包时钉死（11.7.0/11.3.0/v22.19.0/2.47.1），
+//   一落后就撞上游新问题（实测内置 pnpm 11.7.0 崩 / 11.25.0 成）——跟随不是发版的事，是启动器的事。
+function ttlCacheRead(file) {
+  try {
+    const c = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return c && c.ver && Date.now() - Number(c.at || 0) < 6 * 60 * 60 * 1000 ? String(c.ver) : ''
+  } catch { return '' }
+}
+function ttlCacheWrite(file, ver) {
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify({ ver, at: Date.now() }), 'utf8') } catch { /* 忽略 */ }
+}
+function probeRemoteVersion(nodeBin, script, url, cacheFile, timeoutMs = 6000) {
+  return new Promise(resolve => {
+    const cached = ttlCacheRead(cacheFile)
+    if (cached) return resolve(cached)
+    run(nodeBin, ['-e', script, url], null, timeoutMs).then(r => {
+      const ver = (r.ok && r.out || '').trim()
+      if (!/^[\d.]+$/.test(ver)) return resolve('')
+      ttlCacheWrite(cacheFile, ver)
+      resolve(ver)
+    }).catch(() => resolve(''))
+  })
+}
+
+const NODE_LATEST_SCRIPT = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{const v=(Array.isArray(j)?j:[]).find(x=>x.lts&&typeof x.version==="string");if(v)console.log(v.version)}).catch(()=>process.exit(1))'
+// node：跟随 nodejs.org 最新 LTS（index.json 首个 lts 项；满足 DSH engines ^22.19||>=24）
+async function latestNodeVersion(nodeBin, toolsDir) {
+  for (const url of ['https://nodejs.org/dist/index.json', 'https://npmmirror.com/mirrors/node/index.json']) {
+    const ver = await probeRemoteVersion(nodeBin, NODE_LATEST_SCRIPT, url, path.join(toolsDir, 'node-latest.json'), 8000)
+    if (ver && /^\d+\.\d+\.\d+$/.test(ver)) return ver
+  }
+  return ''
+}
+const GIT_LATEST_SCRIPT = 'fetch(process.argv[1],{headers:{"User-Agent":"zat-launcher"}}).then(r=>r.json()).then(j=>{if(j&&j.tag_name)console.log(String(j.tag_name))}).catch(()=>process.exit(1))'
+// git：跟随 git-for-windows 官方 latest release tag（v2.x.y.windows.N）
+async function latestGitTag(nodeBin, toolsDir) {
+  for (const url of [
+    'https://api.github.com/repos/git-for-windows/git/releases/latest',
+    'https://ghfast.top/https://api.github.com/repos/git-for-windows/git/releases/latest',
+    'https://gh-proxy.com/https://api.github.com/repos/git-for-windows/git/releases/latest',
+  ]) {
+    const tag = await probeRemoteVersion(nodeBin, GIT_LATEST_SCRIPT, url, path.join(toolsDir, 'git-latest.json'), 8000)
+    if (tag && /^\d+\.\d+\.\d+\.windows\.\d+$/.test(tag)) return tag
+  }
+  return ''
+}
+const NPM_TAG_SCRIPT = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>console.log(j.latest||"")).catch(()=>process.exit(1))'
+// npm：跟随 npm@latest，但守住 major=11|12（npm 10.x 的 arborist 解析 @deepseek-ai 依赖树会崩，历史结论）
+async function latestNpmCLIVersion(nodeBin, toolsDir) {
+  const ver = await probeRemoteVersion(nodeBin, NPM_TAG_SCRIPT, 'https://registry.npmjs.org/-/package/npm/dist-tags', path.join(toolsDir, 'npm-latest.json'), 4000)
+  return /^(11|12)\.\d+\.\d+$/.test(ver) ? ver : ''
+}
+
 function findPnpm() {
   // 只认 .cjs / .mjs / .exe：Node 24 的 execFile/spawn 对 .cmd 在无 shell 下直接 EINVAL，
   // 且 zat-tools 里的 pnpm.cmd 包装可能引用已消失的 node/pnpm.cjs（残留垃圾）。
   // .cjs/.mjs 由 executablePnpm 用 node 直接执行；.exe 系统 pnpm 优先（本机 11.22.0）。
   const toolDir = path.join(normalToolsDir(), 'zat-tools') // 长路径（8.3 短路径导致 ESM 解析失败）
   const candidates = [
+    // ★ 1.4.2：在线自升级的版本化入口（pnpm-<version>.mjs）优先于内置 pnpm.mjs（按版本数字排序）
+    ...((() => {
+      try {
+        return fs.readdirSync(toolDir)
+          .filter(n => /^pnpm-\d+\.\d+\.\d+\.mjs$/.test(n))
+          .map(n => path.join(toolDir, n))
+          .sort((a, b) => {
+            const pa = (a.match(/pnpm-([\d.]+)\.mjs$/) || [])[1].split('.').map(Number)
+            const pb = (b.match(/pnpm-([\d.]+)\.mjs$/) || [])[1].split('.').map(Number)
+            for (let i = 0; i < 4; i++) { const x = pa[i] || 0; const y = pb[i] || 0; if (x !== y) return y - x }
+            return 0
+          })
+      } catch { return [] }
+    })()),
     // 白板原则：启动器自举缓存优先（%TEMP%\zat-tools），不依赖机器预装/系统 PATH
     path.join(toolDir, 'pnpm.mjs'),
     path.join(toolDir, 'pnpm.cjs'),
@@ -415,35 +630,44 @@ async function pickRegistry(nodeExe, execute = run) {
 
 // npm 包级工具自举：下载 npm-cli 到 toolsDir（npm registry 官方/国内镜像，3 秒超时切换）。
 // 用 11.x：npm 10.9.2 的 arborist 解析 @deepseek-ai/dsh 依赖树会崩溃（Link.matches null，npm 已知 bug）。
-// ★ 缓存必须先体检再复用（npmCliHealthy）：解压残留/杀软删文件的坏缓存直接弃用重下，
-//   否则任何 npm 调用瞬间崩（2026-08 实机：更新构建全链失败）。
+// ★ 1.4.2：内置默认 = 当前 latest（12.0.2）；在线探测 latest 优先（major 11|12），
+//   每版体检（npmCliHealthy）不过自动换下一版；npm 12 若遇新问题，回退链稳稳保住。
 async function ensureNpmCli({ nodeExe, toolsDir, onProgress, execute = runWithProgress }) {
-  const version = '11.3.0'
   const dir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
-  // 缓存命中：兼容两种结构（tar 解压 package-<v>/package/bin 与 直接 package-<v>/bin），逐一体检
-  for (const sub of [`package-${version}`, 'package']) {
-    for (const inner of ['package', '']) {
-      const candidate = path.join(dir, sub, inner, 'bin', 'npm-cli.js')
-      if (!fs.existsSync(candidate)) continue
-      const healthy = await npmCliHealthy(nodeExe, candidate)
-      if (healthy) return candidate
-      // 坏缓存：移除，走重新下载修复
-      if (onProgress) onProgress('依赖', `npm CLI 自检失败（${sub}），正在重新下载修复…`)
-      try { fs.rmSync(path.join(dir, sub), { recursive: true, force: true }) } catch { /* 移除失败交给下载流程覆盖 */ }
-      break
+  let versionsToTry = ['12.0.2', '11.3.0']
+  try {
+    const latest = await latestNpmCLIVersion(nodeExe, dir)
+    if (latest && !versionsToTry.includes(latest)) versionsToTry.unshift(latest)
+  } catch { /* 探测失败用内置 */ }
+  if (onProgress && versionsToTry[0] !== '12.0.2') onProgress('依赖', `npm CLI 目标版本：${versionsToTry[0]}`)
+  let lastVer = versionsToTry[0]
+  for (const version of versionsToTry) {
+    lastVer = version
+    // 缓存命中：兼容两种结构（tar 解压 package-<v>/package/bin 与 直接 package-<v>/bin），逐一体检
+    for (const sub of [`package-${version}`, 'package']) {
+      for (const inner of ['package', '']) {
+        const candidate = path.join(dir, sub, inner, 'bin', 'npm-cli.js')
+        if (!fs.existsSync(candidate)) continue
+        const healthy = await npmCliHealthy(nodeExe, candidate)
+        if (healthy) return candidate
+        // 坏缓存：移除，走重新下载修复
+        if (onProgress) onProgress('依赖', `npm CLI 自检失败（${sub}），正在重新下载修复…`)
+        try { fs.rmSync(path.join(dir, sub), { recursive: true, force: true }) } catch { /* 移除失败交给下载流程覆盖 */ }
+        break
+      }
     }
+    fs.mkdirSync(dir, { recursive: true })
+    for (let i = 0; i < NPM_REGISTRIES.length; i++) {
+      const base = NPM_REGISTRIES[i].replace(/\/$/, '')
+      const url = `${base}/npm/-/npm-${version}.tgz`
+      if (onProgress) onProgress('依赖', `下载 npm CLI（${version}，源 ${i + 1}/${NPM_REGISTRIES.length}）…`)
+      const entry = await downloadCliTgz(url, dir, version, onProgress)
+      if (entry && (await npmCliHealthy(nodeExe, entry))) return entry
+      if (entry && onProgress) onProgress('依赖', 'npm CLI 下载后自检失败，切换下一源…')
+    }
+    if (onProgress && version !== versionsToTry[versionsToTry.length - 1]) onProgress('依赖', `npm CLI ${version} 全部源失败，回退下一版本…`)
   }
-  fs.mkdirSync(dir, { recursive: true })
-  let lastUrl = ''
-  for (let i = 0; i < NPM_REGISTRIES.length; i++) {
-    const base = NPM_REGISTRIES[i].replace(/\/$/, '')
-    lastUrl = `${base}/npm/-/npm-${version}.tgz`
-    if (onProgress) onProgress('依赖', `下载 npm CLI（${i + 1}/${NPM_REGISTRIES.length}）…`)
-    const entry = await downloadCliTgz(lastUrl, dir, version, onProgress)
-    if (entry && (await npmCliHealthy(nodeExe, entry))) return entry
-    if (entry && onProgress) onProgress('依赖', 'npm CLI 下载后自检失败，切换下一源…')
-  }
-  if (onProgress) onProgress('依赖', `npm CLI 自举失败：${lastUrl}`)
+  if (onProgress) onProgress('依赖', `npm CLI 自举失败：${lastVer}`)
   throw new Error('无法自举 npm CLI（registry 均不可用）')
 }
 
@@ -535,14 +759,21 @@ async function ensureUpdateToolchain({ nodeExe, toolsDir, onProgress, execute = 
 
 // 定位 git：系统 PATH/常见位置优先；都没有时自举 PortableGit 到 toolsDir/git（幂等，已装则跳过）。
 // 返回 git.exe 绝对路径；失败返回 ''（调用方用系统 'git' 兜底）。
-const GIT_MIRRORS = [
-  'https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe',
-  'https://ghfast.top/https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe',
-  'https://ghproxy.net/https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe',
-  'https://gh.llkk.cc/https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe',
-  'https://gh-proxy.com/https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe',
-  'https://ghproxy.com/https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe',
+// ★ 1.4.2：跟随官方 latest release tag（失败回退内置 2.47.1 列表）。
+const GIT_BUILTIN_TAG = 'v2.55.0.windows.5'
+const GIT_BUILTIN_VER = '2.55.0'
+const GIT_HOSTS = [
+  (u) => u,
+  (u) => `https://ghfast.top/${u}`,
+  (u) => `https://ghproxy.net/${u}`,
+  (u) => `https://gh.llkk.cc/${u}`,
+  (u) => `https://gh-proxy.com/${u}`,
+  (u) => `https://ghproxy.com/${u}`,
 ]
+function gitPortableUrls(tag, ver) {
+  const official = `https://github.com/git-for-windows/git/releases/download/${tag}/PortableGit-${ver}-64-bit.7z.exe`
+  return GIT_HOSTS.map(f => f(official))
+}
 
 function findSystemGit() {
   const candidates = []
@@ -584,10 +815,21 @@ async function ensureGit({ toolsDir, onProgress, execute = run }) {
     const system = findSystemGit()
     if (system) return system
     fs.mkdirSync(dir, { recursive: true })
+    // ★ 1.4.2：跟随官方 latest（失败回退内置 2.47.1 列表）
+    let urls = gitPortableUrls(GIT_BUILTIN_TAG, GIT_BUILTIN_VER)
+    try {
+      if (onProgress) onProgress('git', '探测 git-for-windows 最新版本…')
+      const latestTag = await latestGitTag(String(findNodeExe() || 'node'), dir)
+      if (latestTag) {
+        const latestVer = latestTag.replace(/^v/, '').replace(/\.windows\.\d+$/, '')
+        urls = gitPortableUrls(latestTag, latestVer)
+        if (onProgress) onProgress('git', `PortableGit 目标版本：${latestVer}`)
+      }
+    } catch { /* 探测失败用内置 */ }
     let lastErr = ''
-    for (let i = 0; i < GIT_MIRRORS.length; i++) {
-      const url = GIT_MIRRORS[i]
-      if (onProgress) onProgress('git', `下载 PortableGit（${i + 1}/${GIT_MIRRORS.length}：${url.slice(0, 60)}…）`)
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i]
+      if (onProgress) onProgress('git', `下载 PortableGit（${i + 1}/${urls.length}：${url.slice(0, 60)}…）`)
       const pkg = path.join(dir, `portable-git-${i}.7z.exe`)
       const r = await downloadFileNative(url, pkg, onProgress)
       if (!r.ok || !fs.existsSync(pkg) || fs.statSync(pkg).size < 1000000) { fs.rmSync(pkg, { force: true }); lastErr = `源 ${i + 1} 下载失败（${r.err || '无输出'}）`; continue }
@@ -654,7 +896,16 @@ async function ensureNodeExe({ nodeExe, toolsDir, onProgress, execute = runWithP
     } catch { /* 共享目录失败不影响主路径 */ }
     return { ok: true, nodeExe: cached, downloaded: false }
   }
-  const versions = ['v22.19.0', 'v24.4.0', 'v22.20.0'] // 全部满足 DSH engines: ^22.19.0 || >=24.0.0
+  const versions = ['v24.20.0', 'v22.20.0', 'v22.19.0'] // 全部满足 DSH engines: ^22.19.0 || >=24.0.0（★ 1.4.2 内置最新 LTS）
+  // ★ 1.4.2：跟随最新 LTS 优先（内置列表仅兜底）；失败/离线走内置列表
+  try {
+    const latest = await latestNodeVersion(String(nodeExe || 'node'), toolsDir)
+    if (latest) {
+      const vv = `v${latest}`
+      if (!versions.includes(vv)) versions.unshift(vv)
+    }
+    if (onProgress && latest) onProgress('Node', `Node 目标版本：最新 LTS（${latest}）`)
+  } catch { /* 探测失败走内置列表 */ }
   const bases = ['https://nodejs.org/dist', 'https://npmmirror.com/mirrors/node', 'https://mirrors.huaweicloud.com/nodejs', 'https://mirrors.aliyun.com/nodejs-release']
   let lastErr = ''
   for (const version of versions) {
@@ -1019,7 +1270,7 @@ function patchDshSubprocessNoWindow(rootDir) {
 // 而 dist-tags 始终准确（实测 latest=0.1.0-rc.7, next=0.1.0-rc.8 → 返回 rc.8）。
 // 返回版本号字符串（如 '0.1.0-rc.8'）；全部源不可达返回 ''（调用方回退标签）。
 async function resolveLatestDshVersion(nodeExe, timeoutMs = 3000) {
-  const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||""))}).catch(()=>process.exit(1))'
+  const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||"")+" "+(j.alpha||""))}).catch(()=>process.exit(1))'
   // ★ 1.4.0：verCmp 换用 harness-update.compareVersions——旧实现 parseInt('rc')=0，
   //   '0.1.2-rc.1' 被判大于同号正式版 '0.1.2'（语义颠倒，可能装到降级预发布版）
   const verCmp = compareVersions
@@ -1028,10 +1279,12 @@ async function resolveLatestDshVersion(nodeExe, timeoutMs = 3000) {
     const r = await run(nodeExe, ['-e', script, url], null, timeoutMs)
     if (!r.ok) continue
     const parts = r.out.trim().split(/\s+/).filter(Boolean)
+    // ★ 1.4.2：alpha 标签纳入（官方把 alpha 系列发 npm 并打 alpha 标签——不读则永远检测不到）
     const latest = parts[0] || ''
     const next = parts[1] || ''
-    if (latest && next) return verCmp(next, latest) > 0 ? next : latest
-    if (latest || next) return latest || next
+    const alphaV = parts[2] || ''
+    const pick = [latest, next, alphaV].filter(Boolean).reduce((m, v) => (verCmp(v, m) > 0 ? v : m), '')
+    if (pick) return pick
   }
   return ''
 }
@@ -1039,7 +1292,7 @@ async function resolveLatestDshVersion(nodeExe, timeoutMs = 3000) {
 // 解析任意 @deepseek-ai 包的 dist-tags 最新版本（installProfileBundles 用，
 // pnpm 的 @next 标签在"已装过"目录解析不可靠，必须用具体版本号）
 async function resolvePackageVersion(nodeExe, pkgName, timeoutMs = 3000) {
-  const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||""))}).catch(()=>process.exit(1))'
+  const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||"")+" "+(j.alpha||""))}).catch(()=>process.exit(1))'
   // ★ 1.4.0：同 resolveLatestDshVersion——统一 compareVersions 语义（预发布 < 正式版）
   const verCmp = compareVersions
   for (const base of NPM_REGISTRIES) {
@@ -1049,8 +1302,9 @@ async function resolvePackageVersion(nodeExe, pkgName, timeoutMs = 3000) {
     const parts = r.out.trim().split(/\s+/).filter(Boolean)
     const latest = parts[0] || ''
     const next = parts[1] || ''
-    if (latest && next) return verCmp(next, latest) > 0 ? next : latest
-    if (latest || next) return latest || next
+    const alphaV = parts[2] || ''
+    const pick = [latest, next, alphaV].filter(Boolean).reduce((m, v) => (verCmp(v, m) > 0 ? v : m), '')
+    if (pick) return pick
   }
   return ''
 }
@@ -1177,10 +1431,13 @@ module.exports = {
   ensureNpmCli, installOfficialPackage, updateNpmPackage, installProfileBundles,
   ensureNodeExe, findCachedNode, patchDshSubprocessNoWindow, ensureNpmCommand, ensureUpdateToolchain,
   findSystemGit, ensureGit, executablePnpm, ensureConsoleHostDll, spawnWithHiddenConsole, normalToolsDir,
-  GIT_MIRRORS,
+  GIT_MIRRORS: gitPortableUrls, gitPortableUrls,
   executablePnpmOrRaw,
   resolveLatestDshVersion,
   npmCliHealthy, withRetry,
+  probeRegistryPnpmLatest, downloadPnpmDist, builtinPnpmVersion,
   DSH_ORIGIN, DSH_NPM_PACKAGE, DSH_NPM_TAG, NPM_REGISTRIES, SOURCE_TIMEOUT_MS,
 }
+
+
 

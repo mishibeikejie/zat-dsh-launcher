@@ -9,7 +9,7 @@ const {
   probeSource, reachableSource, downloadDshTo,
   ensurePnpm, findPnpm, pickRegistry,
   executablePnpmOrRaw,
-  GIT_MIRRORS,
+  gitPortableUrls,
   NPM_REGISTRIES,
 } = require('../src/fresh-install')
 const {
@@ -105,10 +105,13 @@ test('findPnpm 返回字符串（不抛错）', () => {
 })
 
 test('GIT_MIRRORS 提供多源回退，不依赖单一镜像可达', () => {
-  assert.ok(GIT_MIRRORS.length >= 5, `应至少 5 个源，当前 ${GIT_MIRRORS.length}`)
-  assert.ok(GIT_MIRRORS.some(u => u.includes('ghfast.top')), '缺少 ghfast.top 镜像')
-  assert.ok(GIT_MIRRORS.some(u => u.includes('ghproxy.net')), '缺少 ghproxy.net 镜像')
-  assert.ok(GIT_MIRRORS.some(u => u.includes('gh.llkk.cc')), '缺少 gh.llkk.cc 镜像')
+  // ★ 1.4.2：GIT_MIRRORS 改为 gitPortableUrls(tag, ver) 函数（跟随官方 latest，内置兜底）
+  const urls = gitPortableUrls('v2.55.0.windows.5', '2.55.0')
+  assert.ok(urls.length >= 5, `应至少 5 个源，当前 ${urls.length}`)
+  assert.ok(urls.some(u => u.includes('github.com')), '缺少官方源')
+  assert.ok(urls.some(u => u.includes('ghfast.top')), '缺少 ghfast.top 镜像')
+  assert.ok(urls.some(u => u.includes('ghproxy.net')), '缺少 ghproxy.net 镜像')
+  assert.ok(urls.every(u => u.includes('v2.55.0.windows.5')), 'URL 应使用传入版本')
 })
 
 test('NPM_REGISTRIES 提供多 registry 回退，不依赖单一源可达', () => {

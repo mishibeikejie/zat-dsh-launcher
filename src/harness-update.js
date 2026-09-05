@@ -437,21 +437,37 @@ function compareVersions(a, b) {
 // npm 形态检查：探测 registry 最新版本（node -e fetch），官方优先、npmmirror 回退，每个源 3 秒超时快速切换。
 // 2026-08 实测：@deepseek-ai/dsh 的 latest=0.1.0-rc.7、next=0.1.0-rc.8 —— 必须取 dist-tags 中较新者，
 // 只看 latest 会"检查不到更新"（本地 rc.7 永远最新）。URL 必须带 -/package/ 前缀（否则 404）。
+// ★ 1.4.2：alpha 标签纳入——官方把 alpha 系列发 npm 并打 alpha 标签，不读则永远错过。
 function npmLatestProbe(nodeExe) {
   return async function probeLatest(registry) {
     const base = String(registry).replace(/\/$/, '')
-    const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||""))}).catch(()=>process.exit(1))'
+    const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||"")+" "+(j.alpha||""))}).catch(()=>process.exit(1))'
     const r = await run(nodeExe, ['-e', script, `${base}/-/package/@deepseek-ai/dsh/dist-tags`], null, 3000)
     if (!r.ok) return ''
     const parts = r.out.trim().split(/\s+/).filter(Boolean)
-    const latest = parts[0] || ''
-    const next = parts[1] || ''
-    if (latest && next) return compareVersions(next, latest) > 0 ? next : latest
-    return latest || next || ''
+    return [parts[0] || '', parts[1] || '', parts[2] || ''].filter(Boolean).reduce((m, v) => (compareVersions(v, m) > 0 ? v : m), '')
   }
 }
 
-async function checkUpdate(dshDir, execute = run, probeLatest = null) {
+// ★ 1.4.2 基准修正：以 DSH 开源仓库最新发布（GitHub Releases，按发布日期排序）为「上游最新」。
+//  npm 发布可能滞后数小时~数天（实测 0.1.3-alpha.1 已发布 GitHub、npm 尚无）——检查更新
+//  绝不能在 npm 未同步时谎报"已是最新"。返回最近发布的 tag 版本（去掉 dsh-v 前缀）。
+function probeUpstreamLatest(nodeExe) {
+  return async function probe() {
+    const script = 'fetch(process.argv[1],{headers:{"User-Agent":"zat-launcher"}}).then(r=>r.json()).then(j=>{const t=(Array.isArray(j)?j:[]).sort((a,b)=>String(b.published_at||"").localeCompare(String(a.published_at||"")))[0];if(t)console.log(String(t.tag_name||"").replace(/^dsh-v/i,""))}).catch(()=>process.exit(1))'
+    for (const url of [
+      'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=5',
+      'https://ghfast.top/https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=5',
+      'https://gh-proxy.com/https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=5',
+    ]) {
+      const r = await run(nodeExe, ['-e', script, url], null, 6000)
+      if (r.ok && r.out.trim()) return r.out.trim()
+    }
+    return ''
+  }
+}
+
+async function checkUpdate(dshDir, execute = run, probeLatest = null, probeUpstream = null) {
   const local = await localInfo(dshDir, execute)
   if (!local.ok) return local
   if (local.kind === 'npm') {
@@ -462,6 +478,21 @@ async function checkUpdate(dshDir, execute = run, probeLatest = null) {
       if (remoteVersion) break
     }
     if (!remoteVersion) return { ...local, ok: true, checkFailed: true, updateAvailable: false, canInstall: false, message: '网络暂不可用，未完成更新检查' }
+    // ★ 1.4.2：上游（仓库发布日）最新 —— 上游比本地新、但 npm 还没发布该版本时，
+    //   必须如实显示"上游已发布"，绝不能谎报"已是最新"
+    let upstreamVersion = ''
+    if (probeUpstream) { try { upstreamVersion = (await probeUpstream()) || '' } catch { upstreamVersion = '' } }
+    const upstreamNewer = upstreamVersion ? compareVersions(upstreamVersion, local.version) > 0 : false
+    const upstreamUnpublished = upstreamNewer ? compareVersions(remoteVersion, upstreamVersion) < 0 : false
+    if (upstreamNewer && upstreamUnpublished) {
+      return {
+        ...local, ok: true,
+        remoteVersion: upstreamVersion, remoteRef: 'upstream',
+        upstreamOnly: true, behindCount: 1,
+        updateAvailable: true, canInstall: false,
+        message: `上游已发布 ${upstreamVersion}（仓库最新；npm 尚未同步该版本，暂不可安装，将自动跟随）`,
+      }
+    }
     const newer = compareVersions(remoteVersion, local.version) > 0
     return {
       ...local,
@@ -749,4 +780,4 @@ async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
   return { ...(await localInfo(dshDir, execute)), updateAvailable: false, message: 'Harness 已更新到官方版本' }
 }
 
-module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli, findHealthyNpmCli, runPnpmDirect, cleanUntrackedWorkspaceDirs }
+module.exports = { run, readVersion, localInfo, updateSources, checkUpdate, installUpdate, npmLatestProbe, compareVersions, detectKind, NPM_REGISTRIES, runBuild, verifyKeyArtifacts, clearTsBuildInfo, findNpmCli, findHealthyNpmCli, runPnpmDirect, cleanUntrackedWorkspaceDirs, probeUpstreamLatest }

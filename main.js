@@ -2466,7 +2466,7 @@ function registerIpc() {
     let execute = undefined
     let tcEnv = null
     try { tcEnv = await getToolchainEnv(id); execute = makeToolchainExecute(tcEnv.env) } catch { /* 工具链失败时用默认（系统 git 兜底） */ }
-    return checkHarnessUpdate(terminalPaths(id).dshDir, execute, harnessUpdate.npmLatestProbe((tcEnv && tcEnv.nodeExe) || findNodeExe()))
+    return checkHarnessUpdate(terminalPaths(id).dshDir, execute, harnessUpdate.npmLatestProbe((tcEnv && tcEnv.nodeExe) || findNodeExe()), harnessUpdate.probeUpstreamLatest((tcEnv && tcEnv.nodeExe) || findNodeExe()))
   })
   ipcMain.handle('harness:install-update', async (_e, terminalId) => {
     const id = requireTerminalId(terminalId)

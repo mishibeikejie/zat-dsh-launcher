@@ -1,6 +1,6 @@
 {
   "name": "zat-dsh-launcher",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "description": "ZAT-DSH 启动器：多终端 DeepSeek Harness 桌面管理器（安装、启动、监控、更新、救援，终端之间 100% 独立）",
   "main": "main.js",
   "author": "ZAT-DSH Launcher",
