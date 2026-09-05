@@ -1364,8 +1364,15 @@ async function startTerminal(terminalId, startOptions = {}) {
     if (fs.existsSync(path.join(engineDir, 'lib', 'index.js'))) engineManager.patchEngineNoWindow(engineDir)
   } catch { /* 补丁失败不阻断启动 */ }
 
-  // 与插件市场共享工具：确保 %TEMP%\zat-tools 有 pnpm.cjs（市场探测位），启动器装的市场直接复用。
-  // 有全局 pnpm.cjs 就复制一份过去；没有则自举到共享目录——无论哪种，zat-tools 里始终有。
+  // 与插件市场共享工具：确保 %TEMP%\zat-tools 有 pnpm.mjs（市场探测位，PNPM_MJS 注入的就是它），
+  // 启动器装的市场直接复用，不重复下载。
+  // ★ 1.5.2 修正：旧代码只认 .cjs 且没有就 ensurePnpm —— v1.4.2 起主形态是 standalone pnpm.exe，
+  //   .cjs 探测位永远不会被它产生 → 系统已装最新 pnpm 也每次触发 ensurePnpm → 缓存缺失时联网
+  //   下载 39MB。且 ESM 内容绝不能命名为 .cjs（node 按 CJS 解析必崩，市场 node pnpm.cjs 直接挂）。
+  //   正确做法：
+  //   ① 探测位 = pnpm.mjs：复制【内置资产】（asarUnpack 物理文件，ESM 官方 dist，node 直接可跑，零下载）；
+  //   ② standalone 主路径已有可用（findPnpm 命中 exe/cjs/mjs 任一）→ 绝不重复下载；
+  //   ③ 只有完全没有 pnpm 才 ensurePnpm（内部先复用系统同版本 standalone，仍无才联网）。
   try {
     const sharedDir = path.join(freshInstall.normalToolsDir(), 'zat-tools')
     // 清理过期 .cmd 包装残留：仅当内容引用的 node/pnpm 已消失才删（1.4.0 起zat-tools\pnpm.cmd
@@ -1380,20 +1387,30 @@ async function startTerminal(terminalId, startOptions = {}) {
         fs.rmSync(staleShim, { force: true })
       }
     } catch { /* 忽略 */ }
-    const sharedPnpm = path.join(sharedDir, 'pnpm.cjs')
-    if (!fs.existsSync(sharedPnpm)) {
-      fs.mkdirSync(sharedDir, { recursive: true })
-      const existing = freshInstall.findPnpm()
-      if (existing && String(existing).toLowerCase().endsWith('.cjs')) {
-        try { fs.copyFileSync(existing, sharedPnpm) } catch { /* 复制失败继续走自举 */ }
+    fs.mkdirSync(sharedDir, { recursive: true })
+    // ① 市场探测位：内置资产复制为 pnpm.mjs（零下载零网络；node pnpm.mjs 直接可跑）
+    const sharedPnpmMjs = path.join(sharedDir, 'pnpm.mjs')
+    if (!fs.existsSync(sharedPnpmMjs)) {
+      const builtin = path.join(__dirname, 'assets', 'pnpm.cjs')
+      if (fs.existsSync(builtin)) {
+        const tmp = `${sharedPnpmMjs}.${process.pid}.tmp`
+        try {
+          fs.copyFileSync(builtin, tmp)
+          fs.renameSync(tmp, sharedPnpmMjs)
+        } catch {
+          try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
+          try { fs.copyFileSync(builtin, sharedPnpmMjs) } catch { /* 内置复制失败则走 ensurePnpm 兜底 */ }
+        }
       }
-      if (!fs.existsSync(sharedPnpm)) {
-        await freshInstall.ensurePnpm({
-          nodeExe: ensuredNode,
-          toolsDir: sharedDir,
-          onProgress: (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`),
-        })
-      }
+    }
+    // ② 主路径 standalone/任意形态已有可用 → 不再 ensurePnpm（杜绝"已最新仍下载"）
+    // ③ 完全没有才 ensurePnpm（内部：系统同版本 standalone 复用 → 官方下载 → 内置兜底）
+    if (!freshInstall.findPnpm()) {
+      await freshInstall.ensurePnpm({
+        nodeExe: ensuredNode,
+        toolsDir: sharedDir,
+        onProgress: (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`),
+      })
     }
   } catch { /* 共享 pnpm 准备失败不阻断启动 */ }
 
