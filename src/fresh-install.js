@@ -136,35 +136,38 @@ async function downloadDshTo(targetDir, onProgress, execute = runWithProgress, p
 }
 
 // 定位已有 pnpm；工具目录已自举则优先复用（缓存），否则找系统 pnpm；都没有时从 npm 镜像自举
-async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run }) {
+async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run, skipOnline = false }) {
   // ★ 目录归一化（1.0.12）：无论调用方传什么（可能是 8.3 短路径），统一 realpath 长路径，
   //   否则 node ESM 对短路径解析失败（ERR_MODULE_NOT_FOUND，用户朋友机器实测）。
   const rawDir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
   const dir = (() => { try { fs.mkdirSync(rawDir, { recursive: true }); return fs.realpathSync(rawDir) } catch { return normalToolsDir() + '\\zat-tools' } })()
   const cached = path.join(dir, 'pnpm.mjs')
   const nodeBin = nodeExe && nodeExe !== 'pnpm' ? nodeExe : 'node'
-  // ★ 1.4.2 根修：在线跟随 pnpm@latest（内置仅兜底）——registry 比内置新 → 下载官方单文件
-  //   （sha512 校验）→ 体检 → 用之；任何失败静默回退内置。pnpm 未来再更新永不依赖发版。
+  // ★ 1.4.2 根修（权威结论见 PNPM_VERIFIED_VERSIONS）：主路径 = 官方 standalone pnpm.exe
+  //   （仅已验证版本白名单，下载 zip→解压→体检），内置 mjs 仅作网络全挂的兜底。
   try {
-    const latestVer = await probeRegistryPnpmLatest(nodeBin, dir)
-    if (latestVer) {
-      const builtinVer = await builtinPnpmVersion(nodeBin, dir)
-      if (builtinVer && latestVer !== builtinVer) {
-        const upgraded = path.join(dir, `pnpm-${latestVer}.mjs`)
-        if (fs.existsSync(upgraded)) {
-          const r = await run(nodeBin, [upgraded, '--version'], null, 15000)
-          if (r.ok && String(r.out || '').trim() === latestVer) {
-            if (onProgress) onProgress('依赖', `已启用最新 pnpm ${latestVer}`)
-            return upgraded
+    if (!skipOnline) {
+      const latestVer = await probeRegistryPnpmLatest(nodeBin, dir)
+      const target = pickVerifiedPnpmVersion(latestVer)
+      if (target) {
+        // ★ standalone 整体目录落位（pnpm.exe + dist 配对）
+        const exeEntry = path.join(dir, `pnpm-${target}`, 'pnpm.exe')
+        if (fs.existsSync(exeEntry)) {
+          const r = await run(nodeBin, [exeEntry, '--version'], null, 20000)
+          if (r.ok && String(r.out || '').trim() === target) {
+            if (onProgress) onProgress('依赖', `pnpm 官方版就绪：${target}`)
+            return exeEntry
           }
-          try { fs.rmSync(upgraded, { force: true }) } catch { /* 忽略 */ }
+          try { fs.rmSync(exeEntry, { force: true }) } catch { /* 忽略 */ }
         }
-        const dl = await downloadPnpmDist(nodeBin, latestVer, dir, onProgress)
+        const dl = await downloadPnpmStandalone(nodeBin, target, dir, onProgress)
         if (dl) return dl
-        // 下载/校验失败：静默回退内置（不阻塞安装）
+        if (onProgress) onProgress('依赖', 'pnpm 官方版下载失败，回退内置…')
       }
     }
-  } catch { /* 在线探测失败回退内置 */ }
+  } catch { /* 在线探测失败，走内置兜底 */ }
+  // ===== 兜底：内置 mjs 资产（网络全挂时提供；官方 mjs 形态在 Windows 对最新依赖树
+  //       有 worker 崩溃问题，仅用于旧依赖树/极端网络场景） =====
   // 内置资产（asarUnpack 物理文件）；★ 1.4.2：大小幂等比较——缓存与资产不一致（版本升级/损坏）
   // 一律重拷。老用户手里的旧版 pnpm.mjs（撞新依赖链 worker 崩溃：实测 11.7.0 崩 / 11.25.0 成）
   // 自动被升级，无需手删。
@@ -219,6 +222,18 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run }) {
 //   未来 pnpm 再更新/修 bug，用户下次安装自动用上，永不依赖启动器发版。
 const PNPM_LATEST_CACHE_NAME = 'pnpm-latest.json'
 const PNPM_LATEST_TTL_MS = 6 * 60 * 60 * 1000
+// ★ 权威结论（2026-09 实机矩阵验证）：pnpm 官方 npm 分发包 dist/pnpm.mjs 用 node 跑时
+//   worker 在 Windows 上稳定崩溃（11.7/11.22/11.25 × node22/node24 × 新旧依赖树全崩，
+//   错误 "Worker pnpm#N exited with code 1"，崩溃于 @modelcontextprotocol/sdk 依赖链）；
+//   而官方 standalone 二进制（pnpm.exe，内嵌运行时）11.22.0/11.25.0 均真实安装成功。
+//   → 主路径 = 下载官方 standalone zip（pnpm-win32-x64.zip，39MB，多镜像）解压出 pnpm.exe，
+//   仅用「本启动器实机验证通过」的版本白名单，绝不自动跟未验证的最新版；mjs 仅作网络全挂兜底。
+const PNPM_VERIFIED_VERSIONS = ['11.25.0', '11.22.0'] // 白名单：均以真实安装（@deepseek-ai/dsh 依赖树）验证
+function pickVerifiedPnpmVersion(latestVer) {
+  if (latestVer && PNPM_VERIFIED_VERSIONS.includes(latestVer)) return latestVer
+  // 最新未验证：取白名单内最高（宁可慢一拍，不可踩上未验证的坑）
+  return PNPM_VERIFIED_VERSIONS[0]
+}
 
 function probeRegistryPnpmLatest(nodeBin, toolsDir, timeoutMs = 3000) {
   const cacheFile = path.join(toolsDir || path.join(normalToolsDir(), 'zat-tools'), PNPM_LATEST_CACHE_NAME)
@@ -384,30 +399,91 @@ async function latestNpmCLIVersion(nodeBin, toolsDir) {
   return /^(11|12)\.\d+\.\d+$/.test(ver) ? ver : ''
 }
 
+// ★ 下载官方 standalone pnpm（pnpm-win32-x64.zip → pnpm.exe）：多镜像 + 解压 + 版本体检。
+//   返回 exe 路径；失败返回 ''（调用方回退 mjs 内置链）。
+const PNPM_STANDALONE_MIRRORS = (ver) => [
+  `https://github.com/pnpm/pnpm/releases/download/v${ver}/pnpm-win32-x64.zip`,
+  `https://ghfast.top/https://github.com/pnpm/pnpm/releases/download/v${ver}/pnpm-win32-x64.zip`,
+  `https://gh-proxy.com/https://github.com/pnpm/pnpm/releases/download/v${ver}/pnpm-win32-x64.zip`,
+  `https://ghproxy.net/https://github.com/pnpm/pnpm/releases/download/v${ver}/pnpm-win32-x64.zip`,
+  `https://gh.llkk.cc/https://github.com/pnpm/pnpm/releases/download/v${ver}/pnpm-win32-x64.zip`,
+]
+function downloadPnpmStandalone(nodeBin, version, dir, onProgress = null) {
+  return new Promise(resolve => {
+    if (!/^\d+\.\d+\.\d+$/.test(String(version || ''))) return resolve('')
+    fs.mkdirSync(dir, { recursive: true })
+    const zip = path.join(dir, `pnpm-${version}.win32.zip`)
+    const extract = path.join(dir, `pnpm-${version}.win32.extract`)
+    // ★ standalone 不是单文件：pnpm.exe 依赖同目录 dist/，必须整体目录落位
+    const exeDir = path.join(dir, `pnpm-${version}`)
+    const exe = path.join(exeDir, 'pnpm.exe')
+    const cleanup = () => { try { fs.rmSync(zip, { force: true }) } catch { /* 忽略 */ } }
+    ;(async () => {
+      const names = PNPM_STANDALONE_MIRRORS(version)
+      for (let i = 0; i < names.length; i++) {
+        const url = names[i]
+        if (onProgress) onProgress('依赖', `下载 pnpm 官方版（${version}，源 ${i + 1}/${names.length}）…`)
+        const r = await downloadFileNative(url, zip, onProgress, 300000)
+        if (!r.ok || !fs.existsSync(zip) || fs.statSync(zip).size < 5000000) { try { fs.rmSync(zip, { force: true }) } catch { /* 忽略 */ } continue }
+        try { fs.rmSync(extract, { recursive: true, force: true }) } catch { /* 忽略 */ }
+        fs.mkdirSync(extract, { recursive: true })
+        const tar = await run('tar.exe', ['-xzf', zip, '-C', extract], dir, 180000)
+        cleanup()
+        if (!tar.ok) { try { fs.rmSync(extract, { recursive: true, force: true }) } catch { /* 忽略 */ } continue }
+        const exeCandidate = path.join(extract, 'pnpm.exe')
+        const distCandidate = path.join(extract, 'dist')
+        if (!fs.existsSync(exeCandidate)) { try { fs.rmSync(extract, { recursive: true, force: true }) } catch { /* 忽略 */ } continue }
+        const tmp = `${exe}.${process.pid}.tmp`
+        try {
+          fs.rmSync(exeDir, { recursive: true, force: true })
+          fs.mkdirSync(exeDir, { recursive: true })
+          fs.copyFileSync(exeCandidate, path.join(exeDir, 'pnpm.exe'))
+          if (fs.existsSync(distCandidate)) fs.cpSync(distCandidate, path.join(exeDir, 'dist'), { recursive: true })
+          fs.copyFileSync(exeCandidate, tmp)
+          fs.renameSync(tmp, exe)
+        } catch {
+          try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
+          try { fs.rmSync(extract, { recursive: true, force: true }) } catch { /* 忽略 */ }
+          continue
+        }
+        try { fs.rmSync(extract, { recursive: true, force: true }) } catch { /* 忽略 */ }
+        const ver = await run(exe, ['--version'], null, 20000) // ★ exe 直接执行（standalone 自带运行时）
+        if (ver.ok && String(ver.out || '').trim() === version) {
+          if (onProgress) onProgress('依赖', `pnpm 官方版就绪：${version}`)
+          return resolve(exe)
+        }
+        try { fs.rmSync(exeDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
+      }
+      resolve('')
+    })().catch(() => { cleanup(); resolve('') })
+  })
+}
+
 function findPnpm() {
   // 只认 .cjs / .mjs / .exe：Node 24 的 execFile/spawn 对 .cmd 在无 shell 下直接 EINVAL，
   // 且 zat-tools 里的 pnpm.cmd 包装可能引用已消失的 node/pnpm.cjs（残留垃圾）。
   // .cjs/.mjs 由 executablePnpm 用 node 直接执行；.exe 系统 pnpm 优先（本机 11.22.0）。
   const toolDir = path.join(normalToolsDir(), 'zat-tools') // 长路径（8.3 短路径导致 ESM 解析失败）
   const candidates = [
-    // ★ 1.4.2：在线自升级的版本化入口（pnpm-<version>.mjs）优先于内置 pnpm.mjs（按版本数字排序）
+    // ★ 1.4.2：官方 standalone pnpm（pnpm-<ver>\pnpm.exe + dist 配对，版本数字排序取最高）最优——
+    //   mjs 形态在 Windows 对新依赖树有 worker 崩溃问题，绝不优先
     ...((() => {
       try {
         return fs.readdirSync(toolDir)
-          .filter(n => /^pnpm-\d+\.\d+\.\d+\.mjs$/.test(n))
-          .map(n => path.join(toolDir, n))
+          .filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && fs.existsSync(path.join(toolDir, n, 'pnpm.exe')))
+          .map(n => path.join(toolDir, n, 'pnpm.exe'))
           .sort((a, b) => {
-            const pa = (a.match(/pnpm-([\d.]+)\.mjs$/) || [])[1].split('.').map(Number)
-            const pb = (b.match(/pnpm-([\d.]+)\.mjs$/) || [])[1].split('.').map(Number)
+            const pa = (/pnpm-([\d.]+)/.exec(a) || [])[1].split('.').map(Number)
+            const pb = (/pnpm-([\d.]+)/.exec(b) || [])[1].split('.').map(Number)
             for (let i = 0; i < 4; i++) { const x = pa[i] || 0; const y = pb[i] || 0; if (x !== y) return y - x }
             return 0
           })
       } catch { return [] }
     })()),
     // 白板原则：启动器自举缓存优先（%TEMP%\zat-tools），不依赖机器预装/系统 PATH
-    path.join(toolDir, 'pnpm.mjs'),
-    path.join(toolDir, 'pnpm.cjs'),
     path.join(toolDir, 'pnpm.exe'),
+    path.join(toolDir, 'pnpm.cjs'),
+    path.join(toolDir, 'pnpm.mjs'),
     process.env.PNPM_MJS,
     path.join(process.env.LOCALAPPDATA || '', 'pnpm', 'pnpm.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'pnpm', 'pnpm.cjs'),
@@ -741,8 +817,17 @@ async function ensureUpdateToolchain({ nodeExe, toolsDir, onProgress, execute = 
   //   没有系统 pnpm 的白板机器上，缺这个 shim 会让 build:web ENOENT → 更新永远回滚。
   try {
     const shim = path.join(dir, 'pnpm.cmd')
-    const pnpmEntry = /\.mjs$/i.test(String(pnpmExe)) ? String(pnpmExe) : path.join(dir, 'pnpm.mjs')
-    if (nodePath && fs.existsSync(pnpmEntry)) {
+    // ★ 1.4.2：shim 目标优先官方 standalone（.exe 直接调用，不经 node）；无 exe 才用 mjs/cjs
+    const pnpmEntry = /\.exe$/i.test(String(pnpmExe)) ? String(pnpmExe)
+      : fs.existsSync(path.join(dir, 'pnpm.exe')) ? path.join(dir, 'pnpm.exe')
+        : /\.(mjs|cjs)$/i.test(String(pnpmExe)) ? String(pnpmExe)
+          : path.join(dir, 'pnpm.mjs')
+    if (pnpmEntry && pnpmEntry.endsWith('.exe')) {
+      const want = `@echo off\r\n"${pnpmEntry}" %*\r\n`
+      let needWrite = true
+      try { needWrite = fs.readFileSync(shim, 'utf8') !== want } catch { needWrite = true }
+      if (needWrite) fs.writeFileSync(shim, want, 'utf8')
+    } else if (nodePath && fs.existsSync(pnpmEntry)) {
       const want = `@echo off\r\n"${nodePath}" "${pnpmEntry}" %*\r\n`
       let needWrite = true
       try { needWrite = fs.readFileSync(shim, 'utf8') !== want } catch { needWrite = true }
@@ -1438,6 +1523,7 @@ module.exports = {
   probeRegistryPnpmLatest, downloadPnpmDist, builtinPnpmVersion,
   DSH_ORIGIN, DSH_NPM_PACKAGE, DSH_NPM_TAG, NPM_REGISTRIES, SOURCE_TIMEOUT_MS,
 }
+
 
 
 

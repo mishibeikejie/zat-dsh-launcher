@@ -1,5 +1,5 @@
 {
-  "version": "1.5.0",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.0/ZAT-DSH-Launcher-Setup-1.5.0.exe",
-  "notes": "v1.5.0：内置工具全部升级到最新并实现在线自升级——pnpm 11.7.0→11.25.0（修复 DSH 新版依赖树安装 worker 崩溃，实测复现）；npm 11.3.0→12.0.2；Node v22.19.0→v24.20.0 LTS；PortableGit 2.47.1→2.55.0。版本基准修正：以 DSH 开源仓库发布日（GitHub Releases）为最新版判据，npm 未同步时不再谎报\"已是最新\"；npm dist-tags 的 alpha 标签纳入。"
+  "version": "1.5.1",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.1/ZAT-DSH-Launcher-Setup-1.5.1.exe",
+  "notes": "v1.5.1：pnpm 安装失败根治（矩阵实测：官方 dist/pnpm.mjs 用 node 跑 worker 在 Windows 稳定崩溃 ×5 组合；官方 standalone 二进制 11.22/11.25 均真实安装成功）——主路径改为官方 standalone（下载 zip 解压+体检，仅白名单已验证版本）；内置工具全量升最新（pnpm 11.25.0 / npm 12.0.2 / node 24.20.0 LTS / git 2.55.0）并实现在线跟随上游；版本基准以 DSH 仓库发布日为准（npm 未同步不再谎报\"已是最新\"）；alpha 标签纳入探测。"
 }

@@ -78,7 +78,7 @@ test('ensurePnpm 缓存 exists 时直接返回（内置 pnpm 单文件）', asyn
   const realAsset = fs.readFileSync(path.join(__dirname, '..', 'assets', 'pnpm.cjs'))
   fs.writeFileSync(path.join(dir, 'pnpm.mjs'), realAsset)
   const nodeExe = process.execPath
-  const got = await ensurePnpm({ nodeExe, toolsDir: dir })
+  const got = await ensurePnpm({ nodeExe, toolsDir: dir, skipOnline: true })
   assert.equal(got, path.join(dir, 'pnpm.mjs'))
   // 内容仍是健康缓存（未被覆盖）
   assert.ok(fs.readFileSync(path.join(dir, 'pnpm.mjs')).length === realAsset.length)
@@ -91,7 +91,7 @@ test('ensurePnpm 缓存损坏时自动从内置资产重拷（1.4.0 回归）', 
   const corrupt = 'this is not javascript {{{'
   fs.writeFileSync(path.join(dir, 'pnpm.mjs'), corrupt)
   const nodeExe = process.execPath
-  const got = await ensurePnpm({ nodeExe, toolsDir: dir })
+  const got = await ensurePnpm({ nodeExe, toolsDir: dir, skipOnline: true })
   // 损坏缓存必须被淘汰：要么原地替换为内置资产内容，要么改用健康的系统 pnpm——
   // 绝不把损坏文件原样返回
   const stillCorrupt = fs.existsSync(path.join(dir, 'pnpm.mjs')) && fs.readFileSync(path.join(dir, 'pnpm.mjs'), 'utf8') === corrupt
@@ -321,3 +321,4 @@ test('probeEngineRemoteVersion 多源逐个尝试，命中即返回', async () =
   assert.ok(calls.length >= 2) // 官方 raw 失败后切到镜像
   assert.ok(calls.some(u => u.includes('ghfast.top')))
 })
+
