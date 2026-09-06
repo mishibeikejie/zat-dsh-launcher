@@ -70,33 +70,29 @@ test('downloadDshTo 走克隆并带进度；已存在则跳过', async () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('ensurePnpm 缓存 exists 时直接返回（内置 pnpm 单文件）', async () => {
-  // 1.0.11：ensurePnpm 不再下载 tgz；★ 1.4.0：缓存命中先体检（node pnpm.mjs --version），
-  // 健康即返回，损坏自动从内置资产重拷（防杀软删文件/并发截断的永久损坏）
+test('ensurePnpm 自带 standalone 缓存存在时直接返回（1.5.3 原则：只用自带）', async () => {
+  // ★ 1.5.3 用户原则：启动器自带工具齐全就永远只用自带，绝不摸用户系统。
+  //   自带 standalone（pnpm-<ver>\pnpm.exe + dist 配对）优先；mjs 已从主路径剔除
+  //   （官方 mjs 在 Windows 对最新依赖树 worker 稳定崩溃，矩阵实测 5/5）。
   const dir = tmp('zat-pnpm')
-  fs.mkdirSync(dir, { recursive: true })
-  const realAsset = fs.readFileSync(path.join(__dirname, '..', 'assets', 'pnpm.cjs'))
-  fs.writeFileSync(path.join(dir, 'pnpm.mjs'), realAsset)
+  fs.mkdirSync(path.join(dir, 'pnpm-11.25.0'), { recursive: true })
+  fs.writeFileSync(path.join(dir, 'pnpm-11.25.0', 'pnpm.exe'), 'MZ-fake-exe')
+  fs.mkdirSync(path.join(dir, 'pnpm-11.25.0', 'dist'), { recursive: true })
   const nodeExe = process.execPath
   const got = await ensurePnpm({ nodeExe, toolsDir: dir, skipOnline: true })
-  assert.equal(got, path.join(dir, 'pnpm.mjs'))
-  // 内容仍是健康缓存（未被覆盖）
-  assert.ok(fs.readFileSync(path.join(dir, 'pnpm.mjs')).length === realAsset.length)
+  assert.equal(got, path.join(dir, 'pnpm-11.25.0', 'pnpm.exe'))
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('ensurePnpm 缓存损坏时自动从内置资产重拷（1.4.0 回归）', async () => {
-  const dir = tmp('zat-pnpm-bad')
+test('ensurePnpm 无 standalone 且网络异常时不默认返回会崩的 mjs（1.5.3）', async () => {
+  // 用临时干净目录 + 空 PATH：模拟全新机器（无 zat-tools 缓存），且 PATH 无系统 pnpm
+  const dir = tmp('zat-pnpm-nomjs')
   fs.mkdirSync(dir, { recursive: true })
-  const corrupt = 'this is not javascript {{{'
-  fs.writeFileSync(path.join(dir, 'pnpm.mjs'), corrupt)
   const nodeExe = process.execPath
   const got = await ensurePnpm({ nodeExe, toolsDir: dir, skipOnline: true })
-  // 损坏缓存必须被淘汰：要么原地替换为内置资产内容，要么改用健康的系统 pnpm——
-  // 绝不把损坏文件原样返回
-  const stillCorrupt = fs.existsSync(path.join(dir, 'pnpm.mjs')) && fs.readFileSync(path.join(dir, 'pnpm.mjs'), 'utf8') === corrupt
-  assert.equal(stillCorrupt, false)
-  assert.ok(typeof got === 'string' && got.length > 0)
+  // 新原则：mjs 不自动作为主路径兜底（会崩）。返回 '' 让调用方明确报错，
+  // 而不是静默用崩的 mjs 安装。已有别的源码会给出"无可用 pnpm"的真实错误。
+  assert.equal(got, '')
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

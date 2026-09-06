@@ -923,17 +923,23 @@ function nodeSatisfiesDsh(versionText) {
 }
 
 function findNodeExe() {
+  // ★ 1.5.3 产品原则（用户明确）：启动器自带工具齐全就【永远只用自带】，拒绝寻找系统工具。
+  //   自带 = 自举到 %TEMP%\zat-tools 的 node.exe / node-<ver> 目录 / 内置 node 资产。
+  //   顺序：工具链自举缓存 → 常见开发工具缓存 → 系统 PATH / 常见位置（仅自带缺失时兜底）。
   const candidates = [
     process.env.DSH_NODE_EXE,
-    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
-    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs', 'node.exe'),
-    'node',
   ]
-  // ★ 1.4.0（I10）：工具链自举位置纳入候选——无系统 Node 的机器上，一键安装先把 node
-  //   自举到 %TEMP%\zat-tools，startTerminal 不该再对 userData/tools 重复下载一份
+  // ★ 1.4.0（I10）：工具链自举位置【最先】——无系统 Node 的机器上，一键安装先把 node
+  //   自举到 %TEMP%\zat-tools，startTerminal 不该再对 userData/tools 重复下载一份；
+  //   ★ 1.5.3：且自带永远优先于系统（用户原则：自带齐全就用自带，不摸用户系统）
   try {
     const tools = freshInstall.normalToolsDir()
     candidates.push(path.join(tools, 'zat-tools', 'node.exe'))
+    // 版本目录形态的自举缓存（node-<ver>\node.exe）
+    try {
+      const entries = fs.readdirSync(path.join(tools, 'zat-tools')).filter(n => /^node-[\d.]+$/.test(n))
+      for (const n of entries.sort().reverse()) candidates.push(path.join(tools, 'zat-tools', n, 'node.exe'))
+    } catch { /* 无自举缓存目录 */ }
   } catch { /* 忽略 */ }
   // 常见开发工具自带的 node（runtime 缓存目录），递归探测不硬编码个人路径。
   // 例：~/.cache/<tool-runtime>/dependencies/node/bin/node.exe
@@ -959,6 +965,12 @@ function findNodeExe() {
       if (cached) candidates.push(cached)
     }
   } catch { /* 缓存目录不可读则跳过 */ }
+  // 系统 PATH / 常见位置：仅自带缺失时的兜底（用户原则：自带齐全绝不摸系统）
+  candidates.push(
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs', 'node.exe'),
+    'node',
+  )
   for (const c of candidates) {
     if (!c) continue
     try {
@@ -1163,11 +1175,32 @@ function spawnDshArgs(args, dshDir, envObj, toolchainEnv, nodeExe) {
   // 机器上预装什么都不依赖；DSH 内部所有 subprocess 调用都走启动器自带的。
   const childEnv = toolchainEnv && typeof toolchainEnv === 'object' ? { ...toolchainEnv } : { ...process.env }
   childEnv.DSH_HOME = envObj.dshHome && envObj.dshHome.trim() ? envObj.dshHome.trim() : ''
-  // 与插件市场共享工具：把自举的 pnpm 位置通过 PNPM_MJS 注入 DSH 环境，
-  // 市场探测到直接用启动器装好的 pnpm（不重复下载）。长路径 + .mjs（内置单文件形态）。
+  // 与插件市场共享工具：把启动器【自带的 pnpm】位置通过 PNPM_MJS 注入 DSH 环境，
+  // 市场探测到直接用启动器装好的 pnpm，不重复下载、不摸用户系统。
+  // ★ 1.5.3（用户实机崩溃根因之一）：之前注入 zat-tools\pnpm.mjs —— 官方 mjs 形态在
+  //   Windows 对最新依赖树 worker 稳定崩溃（矩阵实测 5/5），市场拿到就崩。
+  //   现在注入自带 standalone（pnpm-<ver>\pnpm.exe，exe+dist 配对），市场代码见
+  //   resolvePnpmCommand：.exe 直接 [c] 执行，无 node 包装，稳定。
   try {
-    const sharedPnpm = path.join(freshInstall.normalToolsDir(), 'zat-tools', 'pnpm.mjs')
-    if (fs.existsSync(sharedPnpm)) childEnv.PNPM_MJS = sharedPnpm
+    const sharedDir = path.join(freshInstall.normalToolsDir(), 'zat-tools')
+    let sharedPnpm = ''
+    try {
+      // 自带 standalone 优先（exe 形态，稳定）
+      const exes = fs.readdirSync(sharedDir)
+        .filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && fs.existsSync(path.join(sharedDir, n, 'pnpm.exe')))
+        .sort((a, b) => {
+          const pa = (/pnpm-([\d.]+)/.exec(a) || [])[1].split('.').map(Number)
+          const pb = (/pnpm-([\d.]+)/.exec(b) || [])[1].split('.').map(Number)
+          for (let i = 0; i < 4; i++) { const x = pa[i] || 0; const y = pb[i] || 0; if (x !== y) return y - x }
+          return 0
+        })
+      if (exes.length) sharedPnpm = path.join(sharedDir, exes[0], 'pnpm.exe')
+    } catch { /* 目录不可读 */ }
+    if (!sharedPnpm) {
+      const p = freshInstall.findPnpm()
+      if (p && /\.exe$/i.test(p)) sharedPnpm = p
+    }
+    if (sharedPnpm && fs.existsSync(sharedPnpm)) childEnv.PNPM_MJS = sharedPnpm
   } catch { /* 注入失败不影响启动 */ }
   return {
     file: cmdNode,
@@ -1364,15 +1397,13 @@ async function startTerminal(terminalId, startOptions = {}) {
     if (fs.existsSync(path.join(engineDir, 'lib', 'index.js'))) engineManager.patchEngineNoWindow(engineDir)
   } catch { /* 补丁失败不阻断启动 */ }
 
-  // 与插件市场共享工具：确保 %TEMP%\zat-tools 有 pnpm.mjs（市场探测位，PNPM_MJS 注入的就是它），
-  // 启动器装的市场直接复用，不重复下载。
-  // ★ 1.5.2 修正：旧代码只认 .cjs 且没有就 ensurePnpm —— v1.4.2 起主形态是 standalone pnpm.exe，
-  //   .cjs 探测位永远不会被它产生 → 系统已装最新 pnpm 也每次触发 ensurePnpm → 缓存缺失时联网
-  //   下载 39MB。且 ESM 内容绝不能命名为 .cjs（node 按 CJS 解析必崩，市场 node pnpm.cjs 直接挂）。
-  //   正确做法：
-  //   ① 探测位 = pnpm.mjs：复制【内置资产】（asarUnpack 物理文件，ESM 官方 dist，node 直接可跑，零下载）；
-  //   ② standalone 主路径已有可用（findPnpm 命中 exe/cjs/mjs 任一）→ 绝不重复下载；
-  //   ③ 只有完全没有 pnpm 才 ensurePnpm（内部先复用系统同版本 standalone，仍无才联网）。
+  // 与插件市场共享工具：确保 %TEMP%\zat-tools 有【自带 standalone pnpm】（市场探测位），
+  // 启动器装的市场直接复用，不重复下载、不摸用户系统。
+  // ★ 1.5.3（用户实机崩溃根因 + 用户原则）：旧逻辑生成 pnpm.mjs 作为"探测位"——
+  //   市场 resolvePnpmCommand 对 .mjs/.cjs 用 [process.execPath, c] node 执行：
+  //   ① 官方 mjs 在 Windows 对新依赖树 worker 稳定崩（矩阵 5/5）→ 市场装包必崩；
+  //   ② ESM 内容命名 .cjs 直接 SyntaxError。两者都是"换了 pnpm 版本也没用"的来源。
+  //   正确：自带 standalone（pnpm-<ver>\pnpm.exe，exe+dist 配对）——市场对 .exe 直接 [c] 执行，稳定。
   try {
     const sharedDir = path.join(freshInstall.normalToolsDir(), 'zat-tools')
     // 清理过期 .cmd 包装残留：仅当内容引用的 node/pnpm 已消失才删（1.4.0 起zat-tools\pnpm.cmd
@@ -1388,29 +1419,18 @@ async function startTerminal(terminalId, startOptions = {}) {
       }
     } catch { /* 忽略 */ }
     fs.mkdirSync(sharedDir, { recursive: true })
-    // ① 市场探测位：内置资产复制为 pnpm.mjs（零下载零网络；node pnpm.mjs 直接可跑）
-    const sharedPnpmMjs = path.join(sharedDir, 'pnpm.mjs')
-    if (!fs.existsSync(sharedPnpmMjs)) {
-      const builtin = path.join(__dirname, 'assets', 'pnpm.cjs')
-      if (fs.existsSync(builtin)) {
-        const tmp = `${sharedPnpmMjs}.${process.pid}.tmp`
-        try {
-          fs.copyFileSync(builtin, tmp)
-          fs.renameSync(tmp, sharedPnpmMjs)
-        } catch {
-          try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
-          try { fs.copyFileSync(builtin, sharedPnpmMjs) } catch { /* 内置复制失败则走 ensurePnpm 兜底 */ }
-        }
-      }
-    }
-    // ② 主路径 standalone/任意形态已有可用 → 不再 ensurePnpm（杜绝"已最新仍下载"）
-    // ③ 完全没有才 ensurePnpm（内部：系统同版本 standalone 复用 → 官方下载 → 内置兜底）
+    // 自带 standalone 已有可用 → 不再 ensurePnpm（绝不重复下载）；❌ 删除 pnpm.mjs 探测位逻辑
+    //（会崩的形态不再生成）；完全没有才 ensurePnpm（内部：自带缓存 → 官方下载，内置 mjs 不作为主路径）
     if (!freshInstall.findPnpm()) {
       await freshInstall.ensurePnpm({
         nodeExe: ensuredNode,
         toolsDir: sharedDir,
         onProgress: (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`),
       })
+      // ensurePnpm 可能仍失败（网络全挂）：明确提示，不静默用崩的 mjs
+      if (!freshInstall.findPnpm()) {
+        pushTerminalLog(terminalId, 'warn', '自带 pnpm 准备失败（网络不可用），插件市场/依赖安装可能受阻——但 DSH 本体不依赖 pnpm，启动继续')
+      }
     }
   } catch { /* 共享 pnpm 准备失败不阻断启动 */ }
 

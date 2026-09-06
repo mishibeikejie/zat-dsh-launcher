@@ -160,66 +160,45 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run, skipOn
           }
           try { fs.rmSync(exeEntry, { force: true }) } catch { /* 忽略 */ }
         }
-        // ★ 1.5.2：下载前先复用系统已装的同版本 standalone pnpm（exe + dist 配对，
-        //   本机已是最新就别再联网下载 39MB——用户明确不满"系统内置都最新还下载"）
-        const local = await reuseLocalPnpmStandalone(target, dir)
-        if (local) {
-          if (onProgress) onProgress('依赖', `pnpm 复用本机已装官方版：${target}`)
-          return local
-        }
+        // ★ 1.5.3 用户原则：不再"复用系统已装的 pnpm"（那是摸用户系统）；
+        //   自带缓存没有就官方下载 standalone（多镜像），零系统依赖。
         const dl = await downloadPnpmStandalone(nodeBin, target, dir, onProgress)
         if (dl) return dl
-        if (onProgress) onProgress('依赖', 'pnpm 官方版下载失败，回退内置…')
+        if (onProgress) onProgress('依赖', 'pnpm 官方版下载失败，将尝试自带缓存…')
       }
     }
   } catch { /* 在线探测失败，走内置兜底 */ }
-  // ===== 兜底：内置 mjs 资产（网络全挂时提供；官方 mjs 形态在 Windows 对最新依赖树
-  //       有 worker 崩溃问题，仅用于旧依赖树/极端网络场景） =====
-  // 内置资产（asarUnpack 物理文件）；★ 1.4.2：大小幂等比较——缓存与资产不一致（版本升级/损坏）
-  // 一律重拷。老用户手里的旧版 pnpm.mjs（撞新依赖链 worker 崩溃：实测 11.7.0 崩 / 11.25.0 成）
-  // 自动被升级，无需手删。
-  const src = path.join(__dirname, '..', 'assets', 'pnpm.cjs')
-  let srcSize = -1
-  try { srcSize = fs.statSync(src).size } catch { /* 资产缺失走 findPnpm 兜底 */ }
-  // ★ 1.4.0：缓存命中先体检（node pnpm.mjs --version）——损坏的 pnpm.mjs 被永久信任会让
-  //   所有安装/更新报语法错误且永不自愈（同 npmCliHealthy/probeGit 的体检惯例）
-  const healthy = async () => {
-    try {
-      const r = await run(nodeBin, [cached, '--version'], null, 8000)
-      return r.ok && /\d+\.\d+/.test(r.out)
-    } catch { return false }
-  }
-  if (fs.existsSync(cached)) {
-    let sizeOk = true
-    if (srcSize > 0) { try { sizeOk = fs.statSync(cached).size === srcSize } catch { sizeOk = false } }
-    if (sizeOk && await healthy()) return cached
-    if (onProgress) onProgress('依赖', '自举 pnpm 缓存与内置版本不一致/自检失败，正在刷新…')
-    try { fs.rmSync(cached, { force: true }) } catch { /* 忽略 */ }
-  }
-  const existing = findPnpm()
-  if (existing && srcSize <= 0) return existing
-  // 内置 pnpm（assets/pnpm.cjs = 官方 dist/pnpm.mjs 单文件）：直接复制，零下载零安装。
-  // asarUnpack 后 Electron 会把 asar 路径透明映射到 resources/app.asar.unpacked 物理文件，
-  // 但显式探测物理路径更稳（打包机/便携版路径不同）。复制失败 = 安装包异常，如实抛出。
-  // ★ 1.4.0：tmp + rename 原子落盘——两个进程并发冷启动（便携版换 userData 可双开）
-  //   直接 copyFileSync 到目标会互相截断，产出损坏的 pnpm.mjs
-  const tmp = `${cached}.${process.pid}.tmp`
+  // ===== 兜底（★ 1.5.3 用户原则：只用自带/已下载的工具，绝不依赖用户系统） =====
+  // 下载失败时：① dir 内已有 standalone 缓存（pnpm-<ver>\pnpm.exe 或 pnpm.exe）直接复用——自带的；
+  //   ② 已有 .cjs（自带构建形态）复用；③ 内置 mjs 资产仅作【最后手段】且打上"风险"说明——
+  //   官方 mjs 在 Windows 对最新依赖树会 worker 崩（矩阵实测 5/5），绝不当首选/主路径。
+  // 优先级先 try 自带 dir 的 standalone，再 cjs，最后才 mjs。绝不跨界摸用户系统。
   try {
-    fs.copyFileSync(src, tmp)
-    fs.renameSync(tmp, cached)
-  } catch {
-    try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
-    fs.copyFileSync(src, cached)
-  }
-  if (!(await healthy())) {
-    // 体检仍失败：再重拷一次（复制中断/杀软瞬时锁场景），尽力而为
-    try {
-      fs.rmSync(cached, { force: true })
-      fs.copyFileSync(src, tmp)
-      fs.renameSync(tmp, cached)
-    } catch { /* 忽略 */ }
-  }
-  return cached
+    // 只在 dir（自带工具目录）范围内找——绝不 across 到系统 PATH / 用户安装位置
+    const scanDir = (base) => {
+      try {
+        const exes = fs.readdirSync(base)
+          .filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && fs.existsSync(path.join(base, n, 'pnpm.exe')))
+          .sort()
+        if (exes.length) return path.join(base, exes[exes.length - 1], 'pnpm.exe')
+      } catch { /* 忽略 */ }
+      for (const name of ['pnpm.exe', 'pnpm.cjs']) {
+        const p = path.join(base, name)
+        if (fs.existsSync(p)) return p
+      }
+      return ''
+    }
+    const own = scanDir(dir)
+    if (own) {
+      if (onProgress) onProgress('依赖', `复用自带 pnpm（${own}）…`)
+      return own
+    }
+  } catch { /* 忽略 */ }
+  // ★ 1.5.3 用户原则：内置 mjs 资产【绝不作为安装主路径返回】——官方 mjs 形态在
+  //   Windows 对最新依赖树会 worker 崩溃（矩阵实测 5/5：11.7/11.22/11.25 × node22/24 全崩），
+  //   返回它 = 装 DSH 必崩 = 用户看到的"换了 pnpm 版本也没用"。宁可返回 '' 让调用方
+  //   明确报错（网络/环境问题），也绝不静默用崩的形态。文件保留在原位仅供诊断。
+  return ''
 }
 
 // ★ 1.4.2 根修：pnpm 在线自升级——内置版本永远可能落后（曾实测内置 11.7.0 撞新依赖链
@@ -406,88 +385,14 @@ async function latestNpmCLIVersion(nodeBin, toolsDir) {
   return /^(11|12)\.\d+\.\d+$/.test(ver) ? ver : ''
 }
 
-// ★ 1.5.2：复用本机已装的同版本 standalone pnpm——系统/LOCALAPPDATA/常见位置的
-//   pnpm.exe（带 dist 配对）版本 === 目标时，本地复制进 zat-tools 缓存，零下载。
-//   本机已最新还联网下载 39MB 纯属浪费（用户已装 11.25.0 仍触发下载的根因之一）。
-async function reuseLocalPnpmStandalone(version, toolsDir) {
-  const findCandidates = () => {
-    const list = []
-    const seen = new Set()
-    const push = (p) => {
-      try {
-        if (!p || seen.has(String(p))) return
-        seen.add(String(p))
-        if (fs.existsSync(String(p))) list.push(String(p))
-      } catch { /* 忽略 */ }
-    }
-    // 系统 PATH 里的 pnpm（pnpm 官方安装器/独立安装都落这里）
-    const which = (name) => {
-      try {
-        const out = require('node:child_process').execFileSync('where.exe', [name], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 5000, windowsHide: true })
-        for (const line of String(out).split(/\r?\n/)) {
-          const t = line.trim().toLowerCase()
-          if (t && (t.endsWith('pnpm.exe') || t.endsWith('pnpm.cmd') || t.endsWith('pnpm.cjs') || t.endsWith('pnpm.mjs'))) push(line.trim())
-        }
-      } catch { /* 不在 PATH */ }
-    }
-    which('pnpm')
-    push(path.join(process.env.LOCALAPPDATA || '', 'pnpm', 'pnpm.exe'))
-    push(path.join(process.env.LOCALAPPDATA || '', 'pnpm', 'pnpm.cjs'))
-    push(path.join(process.env.LOCALAPPDATA || '', 'pnpm', 'pnpm.mjs'))
-    push(path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'pnpm.exe'))
-    push(path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'))
-    push(path.join(process.env.APPDATA || '', 'npm', 'pnpm.cjs'))
-    push(path.join(process.env.APPDATA || '', 'npm', 'pnpm.exe'))
-    return list
-  }
-  const exeOf = (p) => {
-    // .exe 直接用；.cmd 解析真实目标（官方 shim 内容形如 pnpm.exe 调用）；.cjs/.mjs 不适合复用
-    const lower = String(p).toLowerCase()
-    if (lower.endsWith('.exe')) return String(p)
-    if (lower.endsWith('.cmd')) {
-      try {
-        const c = fs.readFileSync(String(p), 'utf8')
-        const m = c.match(/"([^"]+\.exe)"/)
-        if (m && fs.existsSync(m[1])) return m[1]
-      } catch { /* 解析失败 */ }
-    }
-    return ''
-  }
-  for (const cand of findCandidates()) {
-    try {
-      const exe = exeOf(cand)
-      if (!exe) continue
-      // standalone 必须带 dist 配对（官方 zip 结构）；纯 .cmd shim 无 dist 跳过
-      const distDir = path.join(path.dirname(exe), 'dist')
-      if (!fs.existsSync(distDir)) continue
-      const probe = await run(exe, ['--version'], null, 15000)
-      if (!probe.ok || String(probe.out || '').trim() !== version) continue
-      // 命中：整体复制 exe + dist → <toolsDir>/pnpm-<ver>/（原子：先临时目录后 rename）
-      const exeDir = path.join(toolsDir, `pnpm-${version}`)
-      const tmpDir = `${exeDir}.${process.pid}.tmp`
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true })
-        fs.mkdirSync(tmpDir, { recursive: true })
-        fs.copyFileSync(exe, path.join(tmpDir, 'pnpm.exe'))
-        fs.cpSync(distDir, path.join(tmpDir, 'dist'), { recursive: true })
-        const verify = await run(path.join(tmpDir, 'pnpm.exe'), ['--version'], null, 15000)
-        if (!verify.ok || String(verify.out || '').trim() !== version) {
-          try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
-          continue
-        }
-        fs.rmSync(exeDir, { recursive: true, force: true })
-        fs.renameSync(tmpDir, exeDir)
-        return path.join(exeDir, 'pnpm.exe')
-      } catch {
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
-      }
-    } catch { /* 单个候选失败继续 */ }
-  }
-  return ''
-}
+// ★ 1.5.3（用户原则）：【不再】从用户系统复用 pnpm——旧 reuseLocalPnpmStandalone 用
+//   where.exe 找系统 pnpm 复制进工具目录，正是"自带工具齐全仍去找用户系统"的违规实现；
+//   且 toolsDir 若被传相对路径会在项目目录生成 Users�02AppData... 垃圾（实测 93MB 误提仓库）。
+//   自带 standalone 缓存有就直接用（findPnpm），没有就官方下载（downloadPnpmStandalone），
+//   绝不摸用户系统。
 
 // ★ 下载官方 standalone pnpm（pnpm-win32-x64.zip → pnpm.exe）：多镜像 + 解压 + 版本体检。
-//   返回 exe 路径；失败返回 ''（调用方回退 mjs 内置链）。
+//   返回 exe 路径；失败返回 ''（调用方给出明确错误，绝不静默用会崩的 mjs）。
 const PNPM_STANDALONE_MIRRORS = (ver) => [
   `https://github.com/pnpm/pnpm/releases/download/v${ver}/pnpm-win32-x64.zip`,
   `https://ghfast.top/https://github.com/pnpm/pnpm/releases/download/v${ver}/pnpm-win32-x64.zip`,
@@ -547,43 +452,17 @@ function downloadPnpmStandalone(nodeBin, version, dir, onProgress = null) {
 }
 
 function findPnpm() {
-  // 只认 .cjs / .mjs / .exe：Node 24 的 execFile/spawn 对 .cmd 在无 shell 下直接 EINVAL，
+  // ★ 1.5.3 产品原则（用户明确）：启动器自带工具齐全就【永远只用自带】，拒绝寻找系统工具——
+  //   用户 pnpm 装在 D:\Software\nodejs 或任意盘符根本不该我们操心；自带缓存（zat-tools 下
+  //   standalone pnpm-<ver>\pnpm.exe 或 pnpm.exe / pnpm.cjs）优先且只认自带；没有 → 返回 ''
+  //   由调用方 ensurePnpm 自举（官方 standalone 下载 / 复用系统同版本 / 内置资产），
+  //   绝不直接选中 mjs（官方 dist 单文件，Windows 对新依赖树 worker 稳定崩溃，矩阵实测 5/5）。
+  // 只认 .cjs / .exe：Node 24 的 execFile/spawn 对 .cmd 在无 shell 下直接 EINVAL，
   // 且 zat-tools 里的 pnpm.cmd 包装可能引用已消失的 node/pnpm.cjs（残留垃圾）。
-  // .cjs/.mjs 由 executablePnpm 用 node 直接执行；.exe 系统 pnpm 优先（本机 11.22.0）。
+  // .cjs 由 executablePnpm 用 node 直接执行；.exe standalone 直接执行。
   const toolDir = path.join(normalToolsDir(), 'zat-tools') // 长路径（8.3 短路径导致 ESM 解析失败）
-  // ★ 1.5.3（用户实机：node/pnpm 装在 D:\Software\nodejs，候选列表猜不到自定义盘符 → 掉到
-  //   mjs 兜底 → worker 崩溃）：先按【实际 PATH】用 where.exe 解析系统 pnpm（任何盘符/位置），
-  //   解析出的真实形态（.exe 优先 / .cjs 次之）插到候选最前；.cmd shim 解析出真实目标。
-  const pathPnpm = (() => {
-    try {
-      const where = require('node:child_process').execFileSync('where.exe', ['pnpm'], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 5000, windowsHide: true })
-      const found = []
-      const seen = new Set()
-      for (const line of String(where).split(/\r?\n/)) {
-        const t = line.trim()
-        if (!t) continue
-        const lower = t.toLowerCase()
-        if (!/pnpm\.(exe|cmd|cjs|mjs)$/.test(lower)) continue
-        // .cmd shim → 解析真实目标（内容形如 "@node" "@cjs" %* 或引用 pnpm.cjs/exe）
-        let real = ''
-        if (lower.endsWith('.cmd')) {
-          try {
-            const content = fs.readFileSync(t, 'utf8')
-            const m = content.match(/"([^"]+\.(?:cjs|mjs|exe))"/)
-            if (m && fs.existsSync(m[1])) real = m[1]
-          } catch { /* 忽略 */ }
-        } else real = t
-        if (real && !seen.has(real.toLowerCase()) && fs.existsSync(real)) { seen.add(real.toLowerCase()); found.push(real) }
-      }
-      // .exe 优先（standalone 稳定），.cjs 次之，mjs 绝不优先（worker 崩）
-      return [
-        ...found.filter(p => /\.exe$/i.test(p)),
-        ...found.filter(p => /\.cjs$/i.test(p)),
-        ...found.filter(p => /\.mjs$/i.test(p)),
-      ]
-    } catch { return [] }
-  })()
   const candidates = [
+    // ① 自带 standalone（pnpm-<ver>\pnpm.exe + dist 配对，版本数字排序取最高）——白板原则首选
     ...((() => {
       try {
         return fs.readdirSync(toolDir)
@@ -597,47 +476,12 @@ function findPnpm() {
           })
       } catch { return [] }
     })()),
-    // ★ 1.5.3：系统 PATH 实际解析结果（任何盘符都认，不猜固定路径）
-    ...pathPnpm,
-    // ★ 1.5.2：顺序修正——mjs（Windows 对最新依赖树 worker 崩的兜底形态）绝不能排在
-    //   系统 standalone exe 前面：系统已装 11.25.0 exe 时若先命中 zat-tools\pnpm.mjs 旧缓存，
-    //   会绕开稳定的 standalone（且永远走不到系统 exe）。优先级：standalone 缓存 > 系统
-    //   standalone > mjs/cjs 兜底。
+    // ② 自带其余形态（zat-tools 缓存目录，绝不跨出工具目录找系统）
     path.join(toolDir, 'pnpm.exe'),
     path.join(toolDir, 'pnpm.cjs'),
-    // 系统 standalone（pnpm 官方安装器/独立安装）
-    path.join(process.env.LOCALAPPDATA || '', 'pnpm', 'pnpm.exe'),
-    path.join(process.env.LOCALAPPDATA || '', 'pnpm', 'pnpm.cjs'),
-    // 系统 nodejs 全局 pnpm
-    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'),
-    path.join(os.homedir(), 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'),
-    // mjs 兜底（最后）
-    path.join(toolDir, 'pnpm.mjs'),
-    process.env.PNPM_MJS,
+    // ★ 不再包含 pnpm.mjs：mjs 形态已被矩阵定论为 Windows worker 崩溃形态，任何情况下
+    //   都不能被 findPnpm 直接选中作为"可用"；确保 ensurePnpm 先尝试 standalone/系统复用。
   ]
-  // 常见开发工具自带的 pnpm（runtime 缓存，与 findNodeExe 同一套递归探测，不硬编码个人路径）
-  const findUnderCache = (dir, depth) => {
-    if (depth > 5) return null
-    for (const sub of ['node_modules/pnpm/bin/pnpm.cjs', 'pnpm/pnpm.cjs', 'bin/pnpm.cjs']) {
-      const p = path.join(dir, sub)
-      if (fs.existsSync(p)) return p
-    }
-    let entries
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return null }
-    for (const ent of entries) {
-      if (!ent.isDirectory() || ent.name === 'node_modules' || ent.name.startsWith('.')) continue
-      const r = findUnderCache(path.join(dir, ent.name), depth + 1)
-      if (r) return r
-    }
-    return null
-  }
-  try {
-    const homeCache = path.join(os.homedir(), '.cache')
-    if (fs.existsSync(homeCache)) {
-      const cached = findUnderCache(homeCache, 0)
-      if (cached) candidates.push(cached)
-    }
-  } catch { /* 缓存目录不可读则跳过 */ }
   for (const c of candidates) if (c && fs.existsSync(c)) return c
   return ''
 }
