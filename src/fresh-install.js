@@ -135,7 +135,8 @@ async function downloadDshTo(targetDir, onProgress, execute = runWithProgress, p
   return { ok: true, dir: targetDir }
 }
 
-// 定位已有 pnpm；工具目录已自举则优先复用（缓存），否则找系统 pnpm；都没有时从 npm 镜像自举
+// ★ 1.5.3 用户原则：确保自带 pnpm——工具目录自举缓存优先（findPnpm），没有则官方下载
+//   standalone（多镜像）；绝不找用户系统 pnpm（用户装在哪个盘都不关我们事）。
 async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run, skipOnline = false }) {
   // ★ 目录归一化（1.0.12）：无论调用方传什么（可能是 8.3 短路径），统一 realpath 长路径，
   //   否则 node ESM 对短路径解析失败（ERR_MODULE_NOT_FOUND，用户朋友机器实测）。
@@ -765,8 +766,9 @@ async function ensureUpdateToolchain({ nodeExe, toolsDir, onProgress, execute = 
   const npmCmd = await ensureNpmCommand({ nodeExe: nodePath, toolsDir: dir, onProgress, execute })
   const npmFirstDirs = []
   if (npmCmd) npmFirstDirs.push(dir)
-  // 3) pnpm：系统 pnpm 优先，否则自举 cjs。绝不生成 .cmd 包装（Node 24 execFile(.cmd) EINVAL），
-  //    .cjs 由 executablePnpm 用 node 执行；env.PATH 加 node/pnpm 目录供 DSH build 的 pnpm 命令解析。
+  // 3) pnpm：自带缓存在前（findPnpm 只认自带），自举时官方 standalone 下载。绝不生成 .cmd
+  //    包装（Node 24 execFile(.cmd) EINVAL），.cjs 由 executablePnpm 用 node 执行；
+  //    env.PATH 加 node/pnpm 目录供 DSH build 的 pnpm 命令解析。
   let pnpmExe = ''
   try { pnpmExe = findPnpm() } catch { pnpmExe = '' }
   if (!pnpmExe || !fs.existsSync(pnpmExe)) {
@@ -803,7 +805,8 @@ async function ensureUpdateToolchain({ nodeExe, toolsDir, onProgress, execute = 
       if (needWrite) fs.writeFileSync(shim, want, 'utf8')
     }
   } catch { /* shim 失败不阻断（有系统 pnpm 的机器不需要） */ }
-  // 4) git：系统 git 优先，没有则自举 PortableGit 到 zat-tools\git（官方 GitHub → ghfast/gh-proxy 镜像）
+  // 4) git：自带 PortableGit（zat-tools\git）优先，缺失时自举下载官方 PortableGit（多镜像）；
+  //    ★ 1.5.3 用户原则：不找用户系统 git。装机时自带的 portable git 就是工具链的一部分。
   const gitExe = await ensureGit({ toolsDir: dir, onProgress, execute })
   if (gitExe) extraDirs.push(path.dirname(gitExe))
   // npm 目录必须排最前（覆盖 node 发行版自带的旧 npm）；其后 node/pnpm/git/系统 PATH
@@ -829,23 +832,8 @@ function gitPortableUrls(tag, ver) {
   return GIT_HOSTS.map(f => f(official))
 }
 
-function findSystemGit() {
-  const candidates = []
-  try {
-    const which = require('node:child_process').execFileSync('where.exe', ['git'], { stdio: 'pipe', encoding: 'utf8', windowsHide: true })
-    for (const line of String(which || '').split(/\r?\n/)) {
-      const t = line.trim().toLowerCase()
-      if (t && (t.endsWith('git.exe') || t.endsWith('git.cmd'))) candidates.push(line.trim())
-    }
-  } catch { /* 无系统 git */ }
-  const common = [
-    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'cmd', 'git.exe'),
-    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'cmd', 'git.exe'),
-    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'cmd', 'git.exe'),
-  ]
-  for (const c of common) if (fs.existsSync(c)) candidates.push(c)
-  return candidates.find(c => fs.existsSync(c)) || ''
-}
+// ★ 1.5.3 用户原则：findSystemGit 已删除——自带 PortableGit 齐全就用自带，绝不找用户系统 git。
+//   （旧实现 locate 系统 PATH/常见位置，与"只用自带"冲突；已改 ensureGit 直接自举下载。）
 
 // 自举 PortableGit：下载 .7z.exe 自解压包并静默解压（-y -gm2 -o"<dir>"），然后清理自解压壳。
 async function ensureGit({ toolsDir, onProgress, execute = run }) {
@@ -866,8 +854,8 @@ async function ensureGit({ toolsDir, onProgress, execute = run }) {
       if (onProgress) onProgress('git', '缓存 PortableGit 自检失败，重新自举…')
       try { fs.rmSync(gitDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
     }
-    const system = findSystemGit()
-    if (system) return system
+    // ★ 1.5.3 用户原则：自带齐全就用自带，绝不摸用户系统——自带 PortableGit 缺失时
+    //   直接自举下载官方 PortableGit（多镜像），不再 findSystemGit 找用户 git。
     fs.mkdirSync(dir, { recursive: true })
     // ★ 1.4.2：跟随官方 latest（失败回退内置 2.47.1 列表）
     let urls = gitPortableUrls(GIT_BUILTIN_TAG, GIT_BUILTIN_VER)
@@ -1501,7 +1489,7 @@ module.exports = {
   downloadDshTo, ensurePnpm, findPnpm, installDependencies, pickRegistry,
   ensureNpmCli, installOfficialPackage, updateNpmPackage, installProfileBundles,
   ensureNodeExe, findCachedNode, patchDshSubprocessNoWindow, ensureNpmCommand, ensureUpdateToolchain,
-  findSystemGit, ensureGit, executablePnpm, ensureConsoleHostDll, spawnWithHiddenConsole, normalToolsDir,
+  ensureGit, executablePnpm, ensureConsoleHostDll, spawnWithHiddenConsole, normalToolsDir,
   GIT_MIRRORS: gitPortableUrls, gitPortableUrls,
   executablePnpmOrRaw,
   resolveLatestDshVersion,
