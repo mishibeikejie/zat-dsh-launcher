@@ -551,9 +551,39 @@ function findPnpm() {
   // 且 zat-tools 里的 pnpm.cmd 包装可能引用已消失的 node/pnpm.cjs（残留垃圾）。
   // .cjs/.mjs 由 executablePnpm 用 node 直接执行；.exe 系统 pnpm 优先（本机 11.22.0）。
   const toolDir = path.join(normalToolsDir(), 'zat-tools') // 长路径（8.3 短路径导致 ESM 解析失败）
+  // ★ 1.5.3（用户实机：node/pnpm 装在 D:\Software\nodejs，候选列表猜不到自定义盘符 → 掉到
+  //   mjs 兜底 → worker 崩溃）：先按【实际 PATH】用 where.exe 解析系统 pnpm（任何盘符/位置），
+  //   解析出的真实形态（.exe 优先 / .cjs 次之）插到候选最前；.cmd shim 解析出真实目标。
+  const pathPnpm = (() => {
+    try {
+      const where = require('node:child_process').execFileSync('where.exe', ['pnpm'], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 5000, windowsHide: true })
+      const found = []
+      const seen = new Set()
+      for (const line of String(where).split(/\r?\n/)) {
+        const t = line.trim()
+        if (!t) continue
+        const lower = t.toLowerCase()
+        if (!/pnpm\.(exe|cmd|cjs|mjs)$/.test(lower)) continue
+        // .cmd shim → 解析真实目标（内容形如 "@node" "@cjs" %* 或引用 pnpm.cjs/exe）
+        let real = ''
+        if (lower.endsWith('.cmd')) {
+          try {
+            const content = fs.readFileSync(t, 'utf8')
+            const m = content.match(/"([^"]+\.(?:cjs|mjs|exe))"/)
+            if (m && fs.existsSync(m[1])) real = m[1]
+          } catch { /* 忽略 */ }
+        } else real = t
+        if (real && !seen.has(real.toLowerCase()) && fs.existsSync(real)) { seen.add(real.toLowerCase()); found.push(real) }
+      }
+      // .exe 优先（standalone 稳定），.cjs 次之，mjs 绝不优先（worker 崩）
+      return [
+        ...found.filter(p => /\.exe$/i.test(p)),
+        ...found.filter(p => /\.cjs$/i.test(p)),
+        ...found.filter(p => /\.mjs$/i.test(p)),
+      ]
+    } catch { return [] }
+  })()
   const candidates = [
-    // ★ 1.4.2：官方 standalone pnpm（pnpm-<ver>\pnpm.exe + dist 配对，版本数字排序取最高）最优——
-    //   mjs 形态在 Windows 对新依赖树有 worker 崩溃问题，绝不优先
     ...((() => {
       try {
         return fs.readdirSync(toolDir)
@@ -567,6 +597,8 @@ function findPnpm() {
           })
       } catch { return [] }
     })()),
+    // ★ 1.5.3：系统 PATH 实际解析结果（任何盘符都认，不猜固定路径）
+    ...pathPnpm,
     // ★ 1.5.2：顺序修正——mjs（Windows 对最新依赖树 worker 崩的兜底形态）绝不能排在
     //   系统 standalone exe 前面：系统已装 11.25.0 exe 时若先命中 zat-tools\pnpm.mjs 旧缓存，
     //   会绕开稳定的 standalone（且永远走不到系统 exe）。优先级：standalone 缓存 > 系统
