@@ -23,3 +23,6 @@ _backups/
 # 系统
 Thumbs.db
 .DS_Store
+
+# TEMP 变量未展开的路径残骸（测试脚本误生成，非项目文件）
+Users*
