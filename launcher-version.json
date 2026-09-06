@@ -1,5 +1,5 @@
 {
   "version": "1.5.3",
   "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.3/ZAT-DSH-Launcher-Setup-1.5.3.exe",
-  "notes": "v1.5.3：① 系统 pnpm 按实际 PATH 解析（where.exe，任意盘符 D:/E:/F: 都找得到，不再猜死路径）——用户 pnpm 装在 D:\\Software\\nodejs 等自定义位置也能命中，绝不掉进会崩的 mjs 兜底；② 启动不再重复下载 pnpm——系统已装同版本 standalone（exe+dist 配对）直接本地复制，零下载；③ 自带工具链优先（zat-tools 缓存），系统工具按 PATH 实际解析后才兜底，白板原则回归：机器上什么都没有也能跑；④ v1.5.2 的版本号真同步/跨版本数据继承/黑窗根治全部保留。"
+  "notes": "v1.5.3：① 自带工具优先彻底落地——启动器自带的 pnpm/node/npm/git（%TEMP%\\zat-tools 自举缓存）齐全时永远只用自带，绝不摸用户系统；用户 pnpm 装 D 盘/E 盘/F 盘都不影响，启动器自己下载的工具在哪就用在哪；② 彻底移除会崩的 pnpm.mjs——官方 mjs 形态在 Windows 对最新依赖树 worker 稳定崩溃（矩阵实测 5/5），安装/市场/构建任何环节都不再用它，PNPM_MJS 注入改为自带 standalone exe；③ 系统工具仅当自带缓存完全缺失时才兜底，绝不优先；④ v1.5.2 的版本号真同步/跨版本数据继承/黑窗根治全部保留。"
 }
