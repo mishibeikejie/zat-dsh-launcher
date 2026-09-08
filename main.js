@@ -435,31 +435,83 @@ function sharedRescueDir(terminalId) {
   return path.join(base, String(terminalId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_'))
 }
 
-// ★ 1.5.6：主动探测运行中 DSH 的 web 首页是否为"插件加载失败"错误页。
-// 这类崩溃进程活着、HTTP 200、日志零输出（实机验证：loader entry 错误只渲染进页面，
-// launcher.log 出现 0 次），进程退出监控和日志诊断全都看不见。返回页面文本（截断）。
-function probeWebErrorPage(port, timeoutMs = 5000) {
+// ★ 1.5.6：主动探测运行中 DSH 的【客户端模块图一致性】——"活着但坏着"崩溃的真正探测。
+// 两条实锤背景：① 插件加载失败页由【前端 JS】渲染，服务端 HTML 与日志里 0 输出；
+// ② 页面带鉴权（不带 token 永远 401，首轮探测就栽在这，一键检测依旧"没有任何问题"）。
+// 做法：带 token 走 303+Set-Cookie 拿到真实页面 → 从 HTML 取 /plugins/?? 模块清单 →
+// 拉取合并模块文件 → 扫描其中 require("@deepseek-ai/dsh-*") 的包是否都在清单里，
+// 缺哪个报哪个 —— 正是 "missed the module table / did not arrive" 的直接成因。
+function probeWebErrorPage(targetUrl, timeoutMs = 6000) {
   return new Promise(resolve => {
+    const fail = () => done({ ok: false, missing: [], moduleCount: 0 })
+    const url = String(targetUrl || '')
+    if (!/^http/i.test(url)) return fail()
     let settled = false
-    let req = null
-    const finish = (text) => {
-      if (settled) return
-      settled = true
-      try { if (req) req.destroy() } catch { /* 已结束 */ }
-      resolve(String(text || ''))
+    const done = (v) => { if (!settled) { settled = true; resolve(v) } }
+    const get = (u, cookie, cb) => {
+      let req = null
+      try {
+        req = require('node:http').get(u, { timeout: timeoutMs, headers: cookie ? { Cookie: cookie } : {} }, res => {
+          const chunks = []
+          res.on('data', c => { if (chunks.length < 80) chunks.push(c) })
+          res.on('end', () => cb({ statusCode: res.statusCode || 0, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }))
+          res.on('error', () => cb(null))
+        })
+        req.on('timeout', () => { try { req.destroy() } catch { /* 已结束 */ } cb(null) })
+        req.on('error', () => cb(null))
+      } catch { cb(null) }
     }
-    try {
-      req = require('node:http').get({ host: '127.0.0.1', port, path: '/', timeout: timeoutMs }, res => {
-        let body = ''
-        res.setEncoding('utf8')
-        res.on('data', c => { if (body.length < 300000) body += c })
-        res.on('end', () => finish(body))
-        res.on('error', () => finish(body))
-      })
-      req.on('timeout', () => finish(''))
-      req.on('error', () => finish(''))
-    } catch { finish('') }
-    const t = setTimeout(() => finish(''), timeoutMs + 2000)
+    const analyze = (r, cookie) => {
+      try {
+        if (!r || r.statusCode !== 200) return fail()
+        // 页面 HTML 里的客户端模块清单（/plugins/??a/client.js,b/client.js&rev=...）
+        const m = String(r.body || '').match(/href="(\/plugins\/\?\?[^"]+)"/)
+        if (!m) return done({ ok: true, missing: [], moduleCount: 0 })
+        const pluginPath = m[1].replace(/&amp;/g, '&')
+        const listPart = pluginPath.split('??')[1] || ''
+        const moduleIds = new Set(decodeURIComponent(listPart.split('&')[0])
+          .split(',').map(s => s.replace(/\/client\.js.*$/i, '').trim()).filter(Boolean))
+        // 主 chunk（引导期已物化的模块）也视为已交付 —— 否则健康实例会被误报
+        // （实机验证：store/primitives/slots 都在主 chunk，真缺席的 dockkit 两边皆无）
+        const mainM = String(r.body || '').match(/src="(\.\/assets\/index-[^"]+\.js)"/)
+        const pluginUrl = new URL(pluginPath, url).href
+        const afterMain = (mainBody) => {
+          get(pluginUrl, cookie, r3 => {
+            try {
+              if (!r3 || r3.statusCode !== 200) return done({ ok: false, missing: [], moduleCount: moduleIds.size })
+              const missing = new Set()
+              const re = /require\("(@deepseek-ai\/dsh-[^"\/]+)"\)/g
+              let mm
+              while ((mm = re.exec(r3.body || ''))) {
+                const id = mm[1]
+                if (moduleIds.has(id)) continue
+                // 主 chunk 已物化 = 引导期交付，健康实例的常态，不算缺失
+                if (mainBody && (mainBody.includes(`"${id}"`) || mainBody.includes(id))) continue
+                missing.add(id)
+              }
+              done({ ok: true, missing: [...missing], moduleCount: moduleIds.size })
+            } catch { fail() }
+          })
+        }
+        if (mainM) {
+          get(new URL(mainM[1], url).href, cookie, r4 => afterMain(r4 && r4.statusCode === 200 ? r4.body : ''))
+        } else {
+          afterMain('')
+        }
+      } catch { fail() }
+    }
+    get(url, null, r1 => {
+      if (!r1) return fail()
+      if (r1.statusCode >= 300 && r1.statusCode < 400) {
+        const cookie = (r1.headers['set-cookie'] || []).map(c => String(c).split(';')[0]).join('; ')
+        let loc = url
+        try { loc = new URL(r1.headers.location || '/', url).href } catch { /* 原地址 */ }
+        get(loc, cookie, r2 => analyze(r2, cookie))
+        return
+      }
+      analyze(r1, '')
+    })
+    const t = setTimeout(() => fail(), timeoutMs * 3 + 1000)
     if (t && t.unref) t.unref()
   })
 }
@@ -1754,22 +1806,33 @@ async function startTerminal(terminalId, startOptions = {}) {
     if (status.running && status.harnessConfirmed && runtime.childProcess && runtime.childProcess.exitCode === null) {
       const readyUrl = readyUrls.get(terminalId) || p.webUrl
       pushTerminalLog(terminalId, 'info', `终端已就绪：${readyUrl}`)
-      // ★ 1.5.6：就绪 ≠ 健康。DSH 有一种"活着但坏着"的崩法：web 正常服务，但插件加载失败
-      //   只渲染成错误页（Failed to load plugins），日志零输出。就绪时主动探测一次首页：
-      //   命中错误页 → 记录崩溃（供一键检测/自动恢复阶梯使用），绝不把坏状态快照成救援点。
+      // ★ 1.5.6：就绪 ≠ 健康。插件加载失败页由前端 JS 渲染（HTML/日志 0 输出），且探测必须
+      //   带 token（401 挡路）。token URL 由 stdout 稍晚于端口就绪推送：最多等 12 秒再探测，
+      //   模块图缺失 → 记录崩溃，绝不把坏状态快照成救援点。
       let pageBroken = false
       try {
-        const pageText = await probeWebErrorPage(p.port)
-        if (/Failed to load plugins/i.test(pageText)) {
-          pageBroken = true
-          const issues = rescue.diagnoseCrash(pageText).issues
-          rescue.recordCrash(sharedRescueDir(terminalId), {
-            exitCode: null, profileDir: p.profileDir, dshDir: p.dshDir, issues,
-            logTail: pageText.split(/\r?\n/).filter(l => /failed to import|Failed to load/i.test(l)).slice(0, 10),
-          })
-          pushTerminalLog(terminalId, 'warn', 'DSH 已启动但插件加载失败（web 可访问但页面为错误页）：已记录到救援崩溃记录，可用「救援 → 一键检测」查看并修复')
+        let tokenUrl = ''
+        for (let i = 0; i < 12 && !tokenUrl; i++) {
+          tokenUrl = readyUrls.get(terminalId) || ''
+          if (!tokenUrl) await new Promise(r => { const t = setTimeout(r, 1000); if (t && t.unref) t.unref() })
         }
-      } catch { /* 错误页探测失败不阻断就绪 */ }
+        if (tokenUrl) {
+          const probe = await probeWebErrorPage(tokenUrl)
+          if (probe.ok && probe.missing.length) {
+            pageBroken = true
+            rescue.recordCrash(sharedRescueDir(terminalId), {
+              exitCode: null, profileDir: p.profileDir, dshDir: p.dshDir,
+              issues: [{
+                type: 'client-module-missing', plugin: probe.missing[0],
+                message: `客户端模块缺失（${probe.missing.join('、')} 未随模块清单下发）：前端/依赖与主程序版本不配套，需要重建源码或重装 profile 依赖后重启`,
+                fix: 'reinstall',
+              }],
+              logTail: [],
+            })
+            pushTerminalLog(terminalId, 'warn', `DSH 已启动但客户端模块缺失（${probe.missing.join('、')}）：已记录到救援崩溃记录，可用「救援 → 一键检测」查看并修复`)
+          }
+        }
+      } catch { /* 模块图探测失败不阻断就绪 */ }
       // 成功启动 = 新的好状态：重置自动恢复阶梯，下次崩溃重新从 L1 走；同时自动刷新救援点
       runtime.autoFixLevel = 0
       runtime.autoRestartCount = 0
@@ -2110,21 +2173,29 @@ async function connectDshDirectory(dshDirInput, sourceType = 'manual', options =
   const attachedNow = runtime && runtime.state === 'attached-running' && runtime.ownership === 'attached'
   // 接入的是运行中的正常 DSH：自动备份当前 profile 作为救援点（正常状态 = 好点）。
   // 由启动器启动的终端在每次成功启动时自动更新救援点；attached 接入不经过启动流程，这里补上。
-  // ★ 1.5.6：接入前先探测错误页 —— "活着但坏着"（插件加载失败页）的 DSH 不是好点，
-  //   记崩溃、不建救援点，让「一键检测」能立刻看到真实问题。
+  // ★ 1.5.6：接入前先做模块图探测（须有本启动器记录的 token URL，外部手起的没有就跳过）——
+  //   "活着但坏着"的 DSH 不是好点，记崩溃、不建救援点。
   if (attachedNow) {
+    const tokenUrl = readyUrls.get(id) || ''
     let pageBroken = false
-    try {
-      const pageText = await probeWebErrorPage(port)
-      if (/Failed to load plugins/i.test(pageText)) {
-        pageBroken = true
-        const issues = rescue.diagnoseCrash(pageText).issues
-        rescue.recordCrash(sharedRescueDir(id), {
-          exitCode: null, profileDir: terminalPaths(id).profileDir, dshDir: inspected.dir, issues, logTail: [],
-        })
-        pushLog('warn', '接入的 DSH 正在运行但插件加载失败（错误页）：已记录到救援崩溃记录，可在「救援 → 一键检测」查看并修复')
-      }
-    } catch { /* 错误页探测失败不阻断接入 */ }
+    if (tokenUrl) {
+      try {
+        const probe = await probeWebErrorPage(tokenUrl)
+        if (probe.ok && probe.missing.length) {
+          pageBroken = true
+          rescue.recordCrash(sharedRescueDir(id), {
+            exitCode: null, profileDir: terminalPaths(id).profileDir, dshDir: inspected.dir,
+            issues: [{
+              type: 'client-module-missing', plugin: probe.missing[0],
+              message: `客户端模块缺失（${probe.missing.join('、')} 未随模块清单下发）：前端/依赖与主程序版本不配套，需要重建源码或重装 profile 依赖后重启`,
+              fix: 'reinstall',
+            }],
+            logTail: [],
+          })
+          pushLog('warn', `接入的 DSH 客户端模块缺失（${probe.missing.join('、')}）：已记录到救援崩溃记录，可在「救援 → 一键检测」查看并修复`)
+        }
+      } catch { /* 探测失败不阻断接入 */ }
+    }
     if (!pageBroken) {
       try {
         rescue.markCrashRecovered(sharedRescueDir(id))
@@ -3154,21 +3225,25 @@ function registerIpc() {
         if (probeIssues.length) result.source = 'current-log + diagnostic-probe'
       }
     }
-    // ★ 1.5.6：主动探测运行中 web 的错误页 —— "活着但坏着"的插件加载失败在日志里 0 输出
-    //   （实机教训：loader entry 错误只渲染进页面），仅读日志会误报"没有任何问题"。
+    // ★ 1.5.6：带 token 探测客户端模块图一致性 —— 错误页是前端 JS 渲染的（HTML/日志 0 输出），
+    //   不带 token 会被 401 挡住（首轮修复的教训）。
     if (p && p.port) {
       try {
-        const pageText = await probeWebErrorPage(p.port)
-        if (/Failed to load plugins/i.test(pageText)) {
-          const pageIssues = rescue.diagnoseCrash(pageText).issues
-          const seen = new Set(result.issues.map(i => `${i.type}:${i.plugin}`))
-          for (const issue of pageIssues) {
+        const tokenUrl = readyUrls.get(id) || ''
+        if (tokenUrl) {
+          const probe = await probeWebErrorPage(tokenUrl)
+          if (probe.ok && probe.missing.length) {
+            const issue = {
+              type: 'client-module-missing', plugin: probe.missing[0],
+              message: `客户端模块缺失（${probe.missing.join('、')}）：模块清单里没有它，前端/依赖与主程序版本不配套，需要重建源码或重装 profile 依赖后重启`,
+              fix: 'reinstall',
+            }
             const key = `${issue.type}:${issue.plugin}`
-            if (!seen.has(key)) { seen.add(key); result.issues.push(issue) }
+            if (!result.issues.some(i => `${i.type}:${i.plugin}` === key)) result.issues.push(issue)
+            result.source = result.source ? `${result.source} + module-graph` : 'module-graph'
           }
-          if (pageIssues.length) result.source = result.source ? `${result.source} + web-page` : 'web-page'
         }
-      } catch { /* 页面探测失败不影响日志诊断结果 */ }
+      } catch { /* 模块图探测失败不影响日志诊断结果 */ }
     }
     // ★ 1.5.6：client-module-missing 按安装形态路由修复动作 —— 源码形态重装依赖修不了
     //   （包本来就齐，缺的是构建产物），必须重建源码；npm 形态保持重装 profile 依赖。

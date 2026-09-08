@@ -506,28 +506,31 @@ async function checkUpdate(dshDir, execute = run, probeLatest = null, probeUpstr
       message: newer ? `发现新版本 ${remoteVersion}（当前 ${local.version}）` : `当前已是最新版本（${local.version}）`,
     }
   }
-  const remoteRef = `refs/remotes/zat-update/${local.branch}`
+  // ★ 1.5.6 根修：源码形态更新只跟随【已发布 release tag（dsh-v*）】，绝不跟 master 开发分支。
+  //   事故实锤：master HEAD 含未发布客户端插件（sidebar-right/dockkit），而 profile 依赖与
+  //   前端都是已发布 alpha.2 —— 服务端扫描到新插件、前端模块表没有 → "Failed to load plugins"
+  //   （进程活着/HTTP 200/日志 0 输出）。发布 tag 的组件彼此配套，永远对齐。
   let source = ''
   for (const candidate of updateSources(local.origin)) {
-    const fetched = await execute('git', ['fetch', '--force', '--no-tags', candidate, `${local.branch}:${remoteRef}`], dshDir, 3000)
+    const fetched = await execute('git', ['fetch', '--force', '--tags', candidate, 'refs/tags/dsh-v*:refs/tags/dsh-v*'], dshDir, 6000)
     if (fetched.ok) { source = candidate; break }
   }
   if (!source) return { ...local, ok: true, checkFailed: true, updateAvailable: false, canInstall: false, message: '网络暂不可用，未完成更新检查' }
-  const [remoteHead, behind, ahead, remotePackage] = await Promise.all([
-    execute('git', ['rev-parse', '--short', remoteRef], dshDir),
-    execute('git', ['rev-list', '--count', `HEAD..${remoteRef}`], dshDir),
-    execute('git', ['rev-list', '--count', `${remoteRef}..HEAD`], dshDir),
+  const tagsOut = await execute('git', ['tag', '--list', 'dsh-v*'], dshDir, 5000)
+  const latestTag = String(tagsOut.out || '').split(/\r?\n/).map(t => t.trim())
+    .filter(t => /^dsh-v\d+\.\d+/.test(t))
+    .sort((a, b) => compareVersions(a.replace(/^dsh-v/i, ''), b.replace(/^dsh-v/i, '')))
+    .pop() || ''
+  if (!latestTag) return { ...local, ok: true, checkFailed: true, updateAvailable: false, canInstall: false, message: '仓库没有可用的发布版本 tag' }
+  const remoteRef = `refs/tags/${latestTag}`
+  const [remoteHead, remotePackage] = await Promise.all([
+    execute('git', ['rev-parse', '--short', `${remoteRef}^{commit}`], dshDir),
     execute('git', ['show', `${remoteRef}:package.json`], dshDir),
   ])
-  if (!remoteHead.ok || !behind.ok) return { ...local, ok: false, message: `无法读取远端分支 ${remoteRef}` }
-  let remoteVersion = '未知'
-  try { remoteVersion = JSON.parse(remotePackage.out).version || '未知' } catch { /* keep unknown */ }
-  const behindCount = Number(behind.out) || 0
-  const aheadCount = ahead.ok ? (Number(ahead.out) || 0) : 0
-  // ★ 1.4.0（U11）：本地领先/分叉时 merge --ff-only 必败——提前给出可操作指引而非每次
-  //   安装都失败一次（还可能白 stash 一次）
-  const diverged = aheadCount > 0 && behindCount > 0
-  const localAhead = aheadCount > 0 && behindCount === 0
+  if (!remoteHead.ok) return { ...local, ok: false, message: `无法读取发布版本 ${latestTag}` }
+  let remoteVersion = remoteVersionFromTag(latestTag)
+  try { remoteVersion = JSON.parse(remotePackage.out).version || remoteVersion } catch { /* tag 名兜底 */ }
+  const behindCount = compareVersions(remoteVersion, local.version) > 0 ? 1 : 0
   return {
     ...local,
     ok: true,
@@ -537,15 +540,17 @@ async function checkUpdate(dshDir, execute = run, probeLatest = null, probeUpstr
     remoteVersion,
     behindCount,
     updateAvailable: behindCount > 0,
-    // 有本地修改也能安装：安装时会自动 stash 暂存备份，更新完成后恢复（见 installUpdate）
-    // ★ 本地有提交（领先/分叉）时不可安装：ff-only 必败
-    canInstall: behindCount > 0 && aheadCount === 0,
-    message: diverged
-      ? `本地与远端分叉（本地多 ${aheadCount} 个提交、远端多 ${behindCount} 个），无法快进更新。如需官方版本请先处理本地提交（git stash / reset）`
-      : localAhead
-        ? `本地已领先远端 ${aheadCount} 个提交，无需更新（如需官方版本请先回退本地提交）`
-        : behindCount > 0 ? `发现 ${behindCount} 个新提交（远端 ${remoteVersion}）` : `当前已是最新版本（${local.version}，HEAD ${local.commit}）`,
+    // 目标是发布 tag：安装走 checkout 对齐（本地哪怕在未发布分支上也能对齐），无分叉概念
+    canInstall: true,
+    message: behindCount > 0
+      ? `发现新发布版本 ${remoteVersion}（当前 ${local.version}）`
+      : `当前已是最新发布版本（${local.version}）`,
   }
+}
+
+// dsh-vX.Y.Z → X.Y.Z（tag 名兜底解析版本号）
+function remoteVersionFromTag(tag) {
+  return String(tag || '').replace(/^dsh-v/i, '')
 }
 
 // tsc 增量缓存处理策略（1.0.7 提速）：
@@ -701,8 +706,13 @@ async function installUpdate(dshDir, snapshotDir, execute = run, options = {}) {
     if (!stash.ok) return { ...info, ok: false, message: `工作区清理失败（${stash.err || stash.out}），未开始更新` }
     stashed = true
   }
-  const merge = await execute('git', ['merge', '--ff-only', info.remoteRef], dshDir, 120000)
-  if (!merge.ok) return { ...info, ok: false, message: `更新快进失败：${merge.err || merge.out}` }
+  // ★ 1.5.6：目标是发布 tag（refs/tags/）时用 checkout 对齐 —— 本地可能停在未发布的
+  //   master 开发提交上，与 tag 分叉，ff-only merge 必败；checkout 到 tag 才是"对齐到发布版"。
+  //   stash 已保证工作区干净；detached HEAD 是发布对齐的预期形态（localInfo 读 package.json 版本）。
+  const merge = /^refs\/tags\//.test(String(info.remoteRef || ''))
+    ? await execute('git', ['checkout', '--force', String(info.remoteRef).replace(/^refs\/tags\//, '')], dshDir, 120000)
+    : await execute('git', ['merge', '--ff-only', info.remoteRef], dshDir, 120000)
+  if (!merge.ok) return { ...info, ok: false, message: `更新对齐失败：${merge.err || merge.out}` }
   step(`代码已更新（${info.behindCount} 个新提交），正在安装依赖…`)
   let pnpm = options.pnpmExe || null
   if (!pnpm) {

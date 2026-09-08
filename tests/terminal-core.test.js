@@ -137,16 +137,18 @@ test('Harness update check allows install when source has local changes (stash-b
       if (command === 'branch --show-current') return { ok: true, out: 'master', err: '' }
       if (command === 'status --porcelain') return { ok: true, out: ' M local.js', err: '' }
       if (command === 'remote get-url origin') return { ok: true, out: 'https://github.com/deepseek-ai/deepseek-harness.git', err: '' }
-      if (command.startsWith('fetch --force --no-tags ')) { assert.equal(timeout, 3000); return { ok: true, out: '', err: '' } }
-      if (command === 'rev-parse --short refs/remotes/zat-update/master') return { ok: true, out: 'def5678', err: '' }
-      if (command === 'rev-list --count HEAD..refs/remotes/zat-update/master') return { ok: true, out: '3', err: '' }
-      if (command === 'show refs/remotes/zat-update/master:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
+      // ★ 1.5.6：源码形态更新只跟发布 tag（fetch --tags + tag --list + 读 tag 的 package.json）
+      if (command.startsWith('fetch --force --tags ')) { assert.equal(timeout, 6000); return { ok: true, out: '', err: '' } }
+      if (command === 'tag --list dsh-v*') return { ok: true, out: 'dsh-v0.1.0-rc.5\ndsh-v0.1.0-rc.6\n', err: '' }
+      if (command === 'rev-parse --short refs/tags/dsh-v0.1.0-rc.6^{commit}') return { ok: true, out: 'def5678', err: '' }
+      if (command === 'show refs/tags/dsh-v0.1.0-rc.6:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
       return { ok: false, out: '', err: `unexpected ${command}` }
     }
     const result = await checkUpdate(dir, execute)
     assert.equal(result.updateAvailable, true)
     assert.equal(result.remoteVersion, '0.1.0-rc.6')
-    assert.equal(result.behindCount, 3)
+    assert.equal(result.remoteRef, 'refs/tags/dsh-v0.1.0-rc.6')
+    assert.equal(result.behindCount, 1)
     assert.equal(result.dirty, true)
     // 本地修改不再阻止安装：更新器会先 stash 暂存备份，完成后恢复
     assert.equal(result.canInstall, true)
@@ -166,12 +168,13 @@ test('Harness update install stashes local changes, keeps official version per u
       if (command === 'branch --show-current') return { ok: true, out: 'master', err: '' }
       if (command === 'status --porcelain') return { ok: true, out: ' M local.js', err: '' }
       if (command === 'remote get-url origin') return { ok: true, out: 'https://github.com/deepseek-ai/deepseek-harness.git', err: '' }
-      if (command.startsWith('fetch --force --no-tags ')) return { ok: true, out: '', err: '' }
-      if (command === 'rev-parse --short refs/remotes/zat-update/master') return { ok: true, out: 'def5678', err: '' }
-      if (command === 'rev-list --count HEAD..refs/remotes/zat-update/master') return { ok: true, out: '3', err: '' }
-      if (command === 'show refs/remotes/zat-update/master:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
+      if (command.startsWith('fetch --force --tags ')) return { ok: true, out: '', err: '' }
+      if (command === 'tag --list dsh-v*') return { ok: true, out: 'dsh-v0.1.0-rc.5\ndsh-v0.1.0-rc.6\n', err: '' }
+      if (command === 'rev-parse --short refs/tags/dsh-v0.1.0-rc.6^{commit}') return { ok: true, out: 'def5678', err: '' }
+      if (command === 'show refs/tags/dsh-v0.1.0-rc.6:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
       if (command.startsWith('stash push --include-untracked -m zat-update-')) return { ok: true, out: '', err: '' }
-      if (command === 'merge --ff-only refs/remotes/zat-update/master') return { ok: true, out: '', err: '' }
+      // ★ 1.5.6：tag 目标走 checkout 对齐（本地可能停在未发布提交上，ff-only 必败）
+      if (command === 'checkout --force dsh-v0.1.0-rc.6') return { ok: true, out: '', err: '' }
       if (command === 'install --frozen-lockfile') return { ok: true, out: '', err: '' }
       if (command === 'run build') return { ok: true, out: '', err: '' }
       return { ok: false, out: '', err: `unexpected ${command}` }
@@ -179,6 +182,7 @@ test('Harness update install stashes local changes, keeps official version per u
     const result = await installUpdate(dir, path.join(dir, 'snap'), execute, { pnpmExe: 'pnpm' })
     assert.equal(result.ok, true)
     assert.ok(commands.some(c => c.startsWith('stash push --include-untracked -m')))
+    assert.ok(commands.includes('checkout --force dsh-v0.1.0-rc.6'))
     // 用户选择保留官方版本：成功后不 stash pop、不提示保留
     assert.ok(!commands.includes('stash pop'))
     assert.ok(result.message.includes('官方版本'))
@@ -199,12 +203,12 @@ test('Harness update install rolls back without restoring local changes when ins
       if (command === 'branch --show-current') return { ok: true, out: 'master', err: '' }
       if (command === 'status --porcelain') return { ok: true, out: ' M local.js', err: '' }
       if (command === 'remote get-url origin') return { ok: true, out: 'https://github.com/deepseek-ai/deepseek-harness.git', err: '' }
-      if (command.startsWith('fetch --force --no-tags ')) return { ok: true, out: '', err: '' }
-      if (command === 'rev-parse --short refs/remotes/zat-update/master') return { ok: true, out: 'def5678', err: '' }
-      if (command === 'rev-list --count HEAD..refs/remotes/zat-update/master') return { ok: true, out: '3', err: '' }
-      if (command === 'show refs/remotes/zat-update/master:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
+      if (command.startsWith('fetch --force --tags ')) return { ok: true, out: '', err: '' }
+      if (command === 'tag --list dsh-v*') return { ok: true, out: 'dsh-v0.1.0-rc.6\n', err: '' }
+      if (command === 'rev-parse --short refs/tags/dsh-v0.1.0-rc.6^{commit}') return { ok: true, out: 'def5678', err: '' }
+      if (command === 'show refs/tags/dsh-v0.1.0-rc.6:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
       if (command.startsWith('stash push --include-untracked -m zat-update-')) return { ok: true, out: '', err: '' }
-      if (command === 'merge --ff-only refs/remotes/zat-update/master') return { ok: true, out: '', err: '' }
+      if (command === 'checkout --force dsh-v0.1.0-rc.6') return { ok: true, out: '', err: '' }
       if (command.startsWith('install ')) return { ok: false, out: '', err: 'pnpm install failed' }
       if (command === 'reset --hard abc1234') return { ok: true, out: '', err: '' }
       return { ok: false, out: '', err: `unexpected ${command}` }
@@ -232,11 +236,11 @@ test('Harness update install falls back to no-frozen-lockfile on config mismatch
       if (command === 'branch --show-current') return { ok: true, out: 'master', err: '' }
       if (command === 'status --porcelain') return { ok: true, out: '', err: '' }
       if (command === 'remote get-url origin') return { ok: true, out: 'https://github.com/deepseek-ai/deepseek-harness.git', err: '' }
-      if (command.startsWith('fetch --force --no-tags ')) return { ok: true, out: '', err: '' }
-      if (command === 'rev-parse --short refs/remotes/zat-update/master') return { ok: true, out: 'def5678', err: '' }
-      if (command === 'rev-list --count HEAD..refs/remotes/zat-update/master') return { ok: true, out: '3', err: '' }
-      if (command === 'show refs/remotes/zat-update/master:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
-      if (command === 'merge --ff-only refs/remotes/zat-update/master') return { ok: true, out: '', err: '' }
+      if (command.startsWith('fetch --force --tags ')) return { ok: true, out: '', err: '' }
+      if (command === 'tag --list dsh-v*') return { ok: true, out: 'dsh-v0.1.0-rc.6\n', err: '' }
+      if (command === 'rev-parse --short refs/tags/dsh-v0.1.0-rc.6^{commit}') return { ok: true, out: 'def5678', err: '' }
+      if (command === 'show refs/tags/dsh-v0.1.0-rc.6:package.json') return { ok: true, out: JSON.stringify({ version: '0.1.0-rc.6' }), err: '' }
+      if (command === 'checkout --force dsh-v0.1.0-rc.6') return { ok: true, out: '', err: '' }
       // frozen 全失败（lockfile 失配），no-frozen 成功 → 自动降级
       if (command === 'install --frozen-lockfile') return { ok: false, out: '', err: 'ERR_PNPM_LOCKFILE_CONFIG_MISMATCH' }
       if (command === 'install --frozen-lockfile --registry https://registry.npmmirror.com/') return { ok: false, out: '', err: 'ERR_PNPM_LOCKFILE_CONFIG_MISMATCH' }
