@@ -1,5 +1,5 @@
 {
-  "version": "1.5.3",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.3/ZAT-DSH-Launcher-Setup-1.5.3.exe",
-  "notes": "v1.5.3：① 自带工具优先彻底落地——启动器自带的 pnpm/node/npm/git（%TEMP%\\zat-tools 自举缓存）齐全时永远只用自带，绝不摸用户系统；用户 pnpm 装 D 盘/E 盘/F 盘都不影响，启动器自己下载的工具在哪就用在哪；② 彻底移除会崩的 pnpm.mjs——官方 mjs 形态在 Windows 对最新依赖树 worker 稳定崩溃（矩阵实测 5/5），安装/市场/构建任何环节都不再用它，PNPM_MJS 注入改为自带 standalone exe；③ 系统工具仅当自带缓存完全缺失时才兜底，绝不优先；④ v1.5.2 的版本号真同步/跨版本数据继承/黑窗根治全部保留。"
+  "version": "1.5.4",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.4/ZAT-DSH-Launcher-Setup-1.5.4.exe",
+  "notes": "v1.5.4 修复：原生依赖（fs-ext 等）node-gyp 编译时自动探测并注入机器上的 Python（含 Python 3.14），不再因找不到 Python 导致 profile bundle 安装失败与 DSH 启动崩溃。"
 }

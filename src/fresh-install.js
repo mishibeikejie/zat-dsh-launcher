@@ -7,7 +7,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
-const { execFile, spawn } = require('node:child_process')
+const { execFile, execFileSync, spawn } = require('node:child_process')
 const { EventEmitter } = require('node:events')
 const { updateSources, compareVersions } = require('./harness-update')
 const { wrapJsFile } = require('./toolchain-execute')
@@ -34,6 +34,55 @@ const SOURCE_TIMEOUT_MS = 3000
 function normalToolsDir() {
   const t = os.tmpdir()
   try { return fs.realpathSync(t) } catch { return t }
+}
+
+// 原生模块（fs-ext 等）postinstall 用 node-gyp 编译，必须能找到可用的 Python。
+// 很多机器只装了 Python 3.14（node-gyp 默认候选不含它），找不到就安装失败；
+// 这里自动探测并把路径注入 PYTHON / npm_config_python。
+let nodeGypPythonCache = null
+function findNodeGypPython() {
+  if (nodeGypPythonCache !== null) return nodeGypPythonCache
+  const candidates = []
+  for (const key of ['PYTHON', 'npm_config_python']) {
+    const v = String(process.env[key] || '').trim()
+    if (v) candidates.push(v)
+  }
+  const roots = [
+    path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'Python'),
+    process.env.ProgramFiles || 'C:\\Program Files',
+    'C:\\',
+  ]
+  for (const root of roots) {
+    try {
+      for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!ent.isDirectory() || !/^Python\d/i.test(ent.name)) continue
+        candidates.push(path.join(root, ent.name, 'python.exe'))
+      }
+    } catch { /* 目录不存在则跳过 */ }
+  }
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) continue
+      const out = String(execFileSync(candidate, ['-c', 'import sys;print(sys.version_info.major, sys.version_info.minor)'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim()
+      const m = out.match(/^(\d+)\s+(\d+)$/)
+      if (m && Number(m[1]) === 3 && Number(m[2]) >= 6) {
+        nodeGypPythonCache = candidate
+        return candidate
+      }
+    } catch { /* 该 Python 不可用则换下一个 */ }
+  }
+  nodeGypPythonCache = ''
+  return ''
+}
+
+function envWithNodeGypPython(base) {
+  const env = { ...(base || process.env) }
+  const python = findNodeGypPython()
+  if (python) {
+    env.PYTHON = python
+    env.npm_config_python = python
+  }
+  return env
 }
 
 // 执行器归一化：file 可为 { file, args } 对象（executablePnpm 的返回值），展开为 file+args。
@@ -631,8 +680,8 @@ async function installDependencies(dshDir, pnpmCjs, nodeExe, onProgress, execute
   // 会调用裸 `node`，若机器上 node 不在 PATH 则安装失败。任何环境都必须可装。
   const nodeBinDir = nodeExe && nodeExe !== 'pnpm' ? path.dirname(nodeExe) : ''
   const envForPnpm = nodeBinDir
-    ? { ...process.env, PATH: `${nodeBinDir};${process.env.PATH || ''}` }
-    : undefined
+    ? envWithNodeGypPython({ ...process.env, PATH: `${nodeBinDir};${process.env.PATH || ''}` })
+    : envWithNodeGypPython(undefined)
   const runPnpm = (description, args, timeout) => {
     const cmd = pnpmCjs === 'pnpm'
       ? { file: 'pnpm', args }
@@ -1218,7 +1267,7 @@ async function installProfileBundles({ nodeExe, profileDir, toolsDir, onProgress
   const registry = await pickRegistry(nodeExe)
   // 白板原则：优先用调用方注入的工具链 env（内置 node/pnpm/npm/git PATH）；未注入时才拼 node 目录
   const toolchainEnv = execute && execute.env || null
-  const envForCli = toolchainEnv || { ...process.env, PATH: `${path.dirname(nodeExe)};${process.env.PATH || ''}` }
+  const envForCli = envWithNodeGypPython(toolchainEnv || { ...process.env, PATH: `${path.dirname(nodeExe)};${process.env.PATH || ''}` })
   // bundle 版本必须与 DSH 匹配：registry 上 @latest 指向旧版 0.0.1-rc.1，@next 才是当前 rc（与 @deepseek-ai/dsh 同版本线）。
   // 但 pnpm 的 @next 标签在"已装过"目录解析不可靠（实测 add @next 仍装出旧 rc.7），
   // 必须用 dist-tags 动态解析出的具体版本号（rc.7→rc.8 更新实测 3.9s 成功）；
@@ -1381,7 +1430,7 @@ async function installOfficialPackage({ nodeExe, toolsDir, targetDir, onProgress
   const registry = await pickRegistry(nodeExe)
   // 白板原则：优先用调用方注入的工具链 env（内置 node/pnpm/npm/git PATH）；未注入时才拼 node 目录
   const toolchainEnv = execute && execute.env || null
-  const envForCli = toolchainEnv || { ...process.env, PATH: `${path.dirname(nodeExe)};${process.env.PATH || ''}` }
+  const envForCli = envWithNodeGypPython(toolchainEnv || { ...process.env, PATH: `${path.dirname(nodeExe)};${process.env.PATH || ''}` })
   // 动态解析最新版本号（latest/next 取新），解析失败回退标签
   let spec = `${DSH_NPM_PACKAGE}@${DSH_NPM_TAG}`
   try {
@@ -1449,7 +1498,7 @@ async function updateNpmPackage({ nodeExe, targetDir, toolsDir, onProgress, exec
   if (!pnpm) return { ok: false, message: '未找到 pnpm 且自举失败（网络或环境问题），请检查网络后重试' }
   // 白板原则：优先用调用方注入的工具链 env（内置 node/pnpm/npm/git PATH）；未注入时才拼 node 目录
   const toolchainEnv = execute && execute.env || null
-  const envForCli = toolchainEnv || { ...process.env, PATH: `${path.dirname(nodeExe)};${process.env.PATH || ''}` }
+  const envForCli = envWithNodeGypPython(toolchainEnv || { ...process.env, PATH: `${path.dirname(nodeExe)};${process.env.PATH || ''}` })
   // 动态解析最新版本号（latest/next 取新），解析失败回退标签
   let spec = `${DSH_NPM_PACKAGE}@${DSH_NPM_TAG}`
   try {
@@ -1490,6 +1539,7 @@ module.exports = {
   ensureNpmCli, installOfficialPackage, updateNpmPackage, installProfileBundles,
   ensureNodeExe, findCachedNode, patchDshSubprocessNoWindow, ensureNpmCommand, ensureUpdateToolchain,
   ensureGit, executablePnpm, ensureConsoleHostDll, spawnWithHiddenConsole, normalToolsDir,
+  findNodeGypPython,
   GIT_MIRRORS: gitPortableUrls, gitPortableUrls,
   executablePnpmOrRaw,
   resolveLatestDshVersion,
