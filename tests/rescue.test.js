@@ -129,15 +129,47 @@ test('diagnoseCrash detects unknown CLI option (rc.7 --no-open regression)', () 
 
 // 1.0.6 矩阵扩展：网上搜集的 DSH 真实崩溃案例（官方 discussion #3263/#2889/#1677/#2990）。
 
-test('diagnoseCrash detects bundle-mismatch from failed to import loader entry (群友案例)', () => {
+test('diagnoseCrash detects client-module-missing from failed to import loader entry (群友案例，1.5.6 统一分类)', () => {
   const logs = [
     'Failed to load plugins',
     'failed to import loader entry 12569d5a(dsh-session-manager): client-modules:require("@deepseek-ai/dsh-client-web-react")missed the module table - not a platform seed word,not a materialized module,and no registered package factory (a build-time externals drift,or a dynamic dependency that did not arrive)',
   ]
   const r = diagnoseCrash(logs)
-  const issues = r.issues.filter(i => i.type === 'bundle-mismatch')
-  assert.equal(issues.length, 1, `应识别出 bundle-mismatch: ${JSON.stringify(r.issues)}`)
-  assert.equal(issues[0].fix, 'reinstall', '依赖层面崩溃必须重装依赖，不能只 restart')
+  const issues = r.issues.filter(i => i.type === 'client-module-missing')
+  assert.equal(issues.length, 1, `应识别出 client-module-missing: ${JSON.stringify(r.issues)}`)
+  assert.equal(issues[0].fix, 'reinstall', '默认给重装依赖；源码形态由主进程改路由为 rebuild-source')
+})
+
+test('diagnoseCrash detects client-module-missing from web error page (sidebar-right/dockkit 实机案例)', () => {
+  const logs = [
+    'HARNESS',
+    'Failed to load plugins',
+    'failed to import loader entry da5ffff0 (@deepseek-ai/dsh-client-ui-sidebar-right): client-modules: require("@deepseek-ai/dsh-client-ui-dockkit") missed the module table - not a platform seed word, not a materialized module, and no registered package factory (a build-time externals drift, or a dynamic dependency that did not arrive)',
+  ]
+  const r = diagnoseCrash(logs)
+  const issues = r.issues.filter(i => i.type === 'client-module-missing')
+  assert.equal(issues.length, 1, `应识别出 client-module-missing: ${JSON.stringify(r.issues)}`)
+  assert.ok(issues[0].message.includes('重建源码'), '消息应说明两种形态的修法')
+})
+
+test('diagnoseCrash detects native-deps from missing .node binary (fs-ext 实机案例)', () => {
+  const logs = [
+    'failed to import loader entry boot(dsh-app): loader crashed',
+    "[cause]: Error: Cannot find module './build/Release/fs_ext.node'",
+    'Require stack:',
+    '- C:\\Users\\23102\\.dsh\\profiles\\web\\node_modules\\fs-ext\\fs-ext.js',
+  ]
+  const r = diagnoseCrash(logs)
+  const native = r.issues.filter(i => i.type === 'native-deps')
+  assert.equal(native.length, 1, `应识别出 native-deps: ${JSON.stringify(r.issues)}`)
+  assert.equal(native[0].fix, 'reinstall', '原生依赖未编译必须重装依赖重新编译')
+})
+
+test('diagnoseCrash detects native-deps from NODE_MODULE_VERSION ABI mismatch', () => {
+  const r = diagnoseCrash(['was compiled against a different Node.js version using NODE_MODULE_VERSION 137. This version requires 115'])
+  const native = r.issues.filter(i => i.type === 'native-deps')
+  assert.equal(native.length, 1, `应识别出 native-deps: ${JSON.stringify(r.issues)}`)
+  assert.equal(native[0].fix, 'reinstall')
 })
 
 test('diagnoseCrash detects bundle-mismatch from Unknown file extension .css (rc.8 错配)', () => {

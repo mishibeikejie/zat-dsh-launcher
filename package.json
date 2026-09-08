@@ -63,7 +63,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "ZAT-DSH启动器",
-      "artifactName": "ZAT-DSH启动器 Setup ${version}.exe"
+      "artifactName": "ZAT-DSH-Launcher-Setup-${version}.exe"
     }
   }
 }

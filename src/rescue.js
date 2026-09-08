@@ -139,6 +139,23 @@ function diagnoseCrash(logLines) {
       add('missing-module', dep, `缺少依赖包「${dep}」`, 'exclude-bundle')
       continue
     }
+    // 原生依赖未编译（1.5.6）：fs-ext 等带 node-gyp 构建的包装上了但 .node 二进制缺失
+    // （install 脚本没跑/编译失败），或 Node ABI 不匹配（NODE_MODULE_VERSION）。
+    // 救援点（仅配置文件）救不了，修复 = 重装 profile 依赖（触发原生模块重新编译）后重启。
+    // 实机案例：Cannot find module './build/Release/fs_ext.node' 曾被误归为 bundle 版本不匹配。
+    if (/Cannot find module ['"][^'"]*\.node['"]/i.test(text) || /NODE_MODULE_VERSION/i.test(text)) {
+      add('native-deps', '', '原生依赖未编译（缺少 .node 二进制或 Node 版本不匹配）：需要重新安装 profile 依赖让原生模块重新编译，然后重启', 'reinstall')
+      continue
+    }
+    // 客户端模块缺失（1.5.6，与"群友案例"同签名统一归类）：failed to import loader entry /
+    // "missed the module table ... a dynamic dependency that did not arrive" = 包已在磁盘上
+    // （服务端扫描得到）但加载不到——根因二选一：npm 形态 = profile 依赖树与主包不同步（重装依赖）；
+    // 源码形态 = 构建产物没跟上依赖树（更新时构建被打断，需 clean + 重建）。
+    // diagnoseCrash 默认给 reinstall；主进程 rescue:diagnose / 自动恢复阶梯按 dshDir 形态路由。
+    if (/failed to import loader entry/i.test(text) || /missed the module table/i.test(text) || /dynamic dependency that did not arrive/i.test(text)) {
+      add('client-module-missing', '', '客户端插件加载失败（包在但模块表缺它：npm 形态需重装 profile 依赖；源码形态需重建源码），修复后重启', 'reinstall')
+      continue
+    }
     // profile 插件与 DSH 版本不匹配：更新主包后 profile bundle 未同步，
     // rc.8 加载旧 bundle 时报 "Unknown file extension .css / ERR_UNKNOWN_FILE_EXTENSION"，
     // 或 bundle 引用主包不存在的模块（failed to import loader entry ... missed the module table）。
@@ -148,10 +165,7 @@ function diagnoseCrash(logLines) {
       add('bundle-mismatch', '', `profile 插件与 DSH 版本不匹配（加载 .${m[1] || '资源'} 失败）：更新 DSH 后 profile 依赖未同步，需要重新安装 profile 依赖后重启`, 'reinstall')
       continue
     }
-    if (/failed to import loader entry/i.test(text)) {
-      add('bundle-mismatch', '', 'profile 插件加载失败（版本不匹配）：bundle 引用了主包不存在的模块，需要重新安装 profile 依赖后重启', 'reinstall')
-      continue
-    }
+    // （旧 loader-entry 独立分支已并入上方 client-module-missing —— 1.5.6 统一签名统一路由）
     // DSH 更新失败回滚后最常见的崩法：git 只回滚源码，packages/**/lib 编译产物与依赖新旧混装，
     // 启动时 plugin tree 报 xxx is not a function（如 ctx.subagents.registerContinuableSetup）。
     // 救援点只有 profile 配置文件，救不了源码目录，必须 clean + 完整重建。

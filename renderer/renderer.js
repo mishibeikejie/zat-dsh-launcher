@@ -532,7 +532,7 @@ function renderRescueDiagnosis(result) {
     els.rescueIssues.appendChild(n)
     return
   }
-  const typeLabel = { 'missing-bundle': '缺失插件', 'plugin-failed': '插件加载失败', 'bad-profile': 'profile 损坏', 'missing-module': '缺少依赖', 'cli-arg': '启动参数不兼容', 'cli-error': '启动命令错误', 'bundle-mismatch': '插件版本不匹配', 'duplicate-plugin': '插件重复注册', 'tool-missing': '工具链缺失', 'source-deps': '源码依赖缺失' }
+  const typeLabel = { 'missing-bundle': '缺失插件', 'plugin-failed': '插件加载失败', 'bad-profile': 'profile 损坏', 'missing-module': '缺少依赖', 'cli-arg': '启动参数不兼容', 'cli-error': '启动命令错误', 'bundle-mismatch': '插件版本不匹配', 'duplicate-plugin': '插件重复注册', 'tool-missing': '工具链缺失', 'source-deps': '源码依赖缺失', 'native-deps': '原生依赖未编译', 'client-module-missing': '客户端模块缺失' }
   for (const issue of issues) {
     const row = document.createElement('div')
     row.className = 'rescue-issue'

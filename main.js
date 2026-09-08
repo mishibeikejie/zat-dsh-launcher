@@ -435,6 +435,35 @@ function sharedRescueDir(terminalId) {
   return path.join(base, String(terminalId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_'))
 }
 
+// ★ 1.5.6：主动探测运行中 DSH 的 web 首页是否为"插件加载失败"错误页。
+// 这类崩溃进程活着、HTTP 200、日志零输出（实机验证：loader entry 错误只渲染进页面，
+// launcher.log 出现 0 次），进程退出监控和日志诊断全都看不见。返回页面文本（截断）。
+function probeWebErrorPage(port, timeoutMs = 5000) {
+  return new Promise(resolve => {
+    let settled = false
+    let req = null
+    const finish = (text) => {
+      if (settled) return
+      settled = true
+      try { if (req) req.destroy() } catch { /* 已结束 */ }
+      resolve(String(text || ''))
+    }
+    try {
+      req = require('node:http').get({ host: '127.0.0.1', port, path: '/', timeout: timeoutMs }, res => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', c => { if (body.length < 300000) body += c })
+        res.on('end', () => finish(body))
+        res.on('error', () => finish(body))
+      })
+      req.on('timeout', () => finish(''))
+      req.on('error', () => finish(''))
+    } catch { finish('') }
+    const t = setTimeout(() => finish(''), timeoutMs + 2000)
+    if (t && t.unref) t.unref()
+  })
+}
+
 function migrateEnvironmentsToRegistry() {
   terminalRegistry = new TerminalRegistry(terminalStorePath())
   terminalRegistry.load()
@@ -874,11 +903,16 @@ function pushTerminalLog(terminalId, level, text, kind = '', conv = '') {
 // 白板原则：启动器所有外部工具调用都走自带工具链，机器预装什么都不依赖。
 let toolchainEnvCache = null
 let toolchainEnvCacheAt = 0
+// ★ 1.5.6：自举单飞——启动/引擎下载/救援诊断并发触发 getToolchainEnv 时共享同一次自举，
+//   绝不并发跑多轮工具链自举（与 ensureGit 单飞配合，杜绝日志里多组下载交错互踩）。
+let toolchainEnvInFlight = null
 
 async function getToolchainEnv(terminalId, onProgress = null) {
   const now = Date.now()
   // 缓存 5 分钟：启动/更新/引擎安装高频调用时不重复自举（自举本身幂等且快，但少跑一次是一次）
   if (toolchainEnvCache && now - toolchainEnvCacheAt < 5 * 60 * 1000) return toolchainEnvCache
+  if (toolchainEnvInFlight) return toolchainEnvInFlight
+  toolchainEnvInFlight = (async () => {
   const log = (stage, message) => {
     // ★ 1.4.0（I5）：支持 onProgress 透传——一键安装向导此前在自举阶段（可达数分钟）
     //   完全无进度，用户当卡死强关
@@ -899,6 +933,8 @@ async function getToolchainEnv(terminalId, onProgress = null) {
   const healthy = !!toolchainEnvCache.nodeExe && !!toolchainEnvCache.pnpmExe
   toolchainEnvCacheAt = now - (healthy ? 0 : 4.5 * 60 * 1000)
   return toolchainEnvCache
+  })()
+  try { return await toolchainEnvInFlight } finally { toolchainEnvInFlight = null }
 }
 
 // 共享工具链执行器：兼容两种调用签名，env 用内部工具链 PATH（git/pnpm/node/npm 全自带）。
@@ -935,6 +971,8 @@ function findNodeExe() {
   try {
     const tools = freshInstall.normalToolsDir()
     candidates.push(path.join(tools, 'zat-tools', 'node.exe'))
+    // ★ 1.5.6：安装包内嵌播种形态（zat-tools\node\node.exe，随 extraResources 发布）
+    candidates.push(path.join(tools, 'zat-tools', 'node', 'node.exe'))
     // 版本目录形态的自举缓存（node-<ver>\node.exe）
     try {
       const entries = fs.readdirSync(path.join(tools, 'zat-tools')).filter(n => /^node-[\d.]+$/.test(n))
@@ -1022,14 +1060,16 @@ async function runAutoFixLevel(terminalId, p, issue, level) {
         if (r.ok) { logStep('源码依赖已安装'); return true }
         logStep(`安装源码依赖失败：${r.message}`); return false
       }
-      if (issue.type === 'bundle-mismatch') {
+      if (issue.type === 'bundle-mismatch' || issue.type === 'native-deps') {
         logStep('重装 profile 官方依赖…')
         const r = await reinstallProfileBundles(terminalId, p)
         if (r.ok) { logStep('profile 依赖已重装（与主包版本匹配）'); return true }
         logStep(`重装失败：${r.message}`); return false
       }
-      if (issue.type === 'source-mixed') {
-        logStep('清理并重建 DSH 源码（clean + build，约 1-5 分钟）…')
+      if (issue.type === 'source-mixed' || (issue.type === 'client-module-missing' && fs.existsSync(path.join(p.dshDir, 'apps', 'cli')))) {
+        // ★ 1.5.6：client-module-missing 源码形态并入本级 —— 包已在盘上，缺的是构建产物
+        //   （更新时构建被打断），重装依赖修不了，必须 clean + 完整重建。
+        logStep('源码形态：清理并重建 DSH 源码（clean + build，约 1-5 分钟）…')
         try {
           const tcEnv = await getToolchainEnv(terminalId)
           const nodeExe = tcEnv.nodeExe || findNodeExe()
@@ -1045,6 +1085,13 @@ async function runAutoFixLevel(terminalId, p, issue, level) {
         } catch (e) {
           logStep(`重建异常：${friendlyError(e)}`); return false
         }
+      }
+      if (issue.type === 'client-module-missing') {
+        // npm 形态：包在但加载不到 = profile 依赖树与主包不同步 → 重装 profile 依赖
+        logStep('重装 profile 官方依赖…')
+        const r = await reinstallProfileBundles(terminalId, p)
+        if (r.ok) { logStep('profile 依赖已重装（与主包版本匹配）'); return true }
+        logStep(`重装失败：${r.message}`); return false
       }
       if ((issue.type === 'missing-bundle' || issue.type === 'plugin-failed' || issue.type === 'duplicate-plugin' || issue.type === 'missing-module') && issue.plugin) {
         const r = rescue.excludePlugin(p.profileDir, issue.plugin)
@@ -1449,7 +1496,16 @@ async function startTerminal(terminalId, startOptions = {}) {
     // 白板原则：引擎下载的 git 调用走内部工具链（系统无 git 也能装）
     let engineExecute = null
     try { engineExecute = makeToolchainExecute((await getToolchainEnv(terminalId)).env) } catch { /* 工具链失败则用系统 git 兜底 */ }
-    const dl = await engineManager.downloadEngineTo(engineDir, (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`), engineExecute)
+    // ★ 1.5.6：引擎下载整体限时 150 秒——绝不允许它阻塞启动（网络烂时 6 镜像探测 + 180 秒克隆
+    //   能静默卡 3 分钟以上且无日志，用户当"崩了"，实机 17:00 后日志鸦雀无声即此因）。
+    //   超时/失败都只警告并照常启动，下次启动自动重试。
+    const dl = await Promise.race([
+      engineManager.downloadEngineTo(engineDir, (stage, message) => pushTerminalLog(terminalId, 'info', `[${stage}] ${message}`), engineExecute),
+      new Promise(resolve => {
+        const t = setTimeout(() => resolve({ ok: false, message: '引擎下载超时' }), 150000)
+        if (t && t.unref) t.unref()
+      }),
+    ])
     if (!dl.ok) {
       pushTerminalLog(terminalId, 'warn', `插件商店自动下载失败（不影响本次启动，下次启动自动重试）：${dl.message}`)
     } else {
@@ -1698,16 +1754,35 @@ async function startTerminal(terminalId, startOptions = {}) {
     if (status.running && status.harnessConfirmed && runtime.childProcess && runtime.childProcess.exitCode === null) {
       const readyUrl = readyUrls.get(terminalId) || p.webUrl
       pushTerminalLog(terminalId, 'info', `终端已就绪：${readyUrl}`)
+      // ★ 1.5.6：就绪 ≠ 健康。DSH 有一种"活着但坏着"的崩法：web 正常服务，但插件加载失败
+      //   只渲染成错误页（Failed to load plugins），日志零输出。就绪时主动探测一次首页：
+      //   命中错误页 → 记录崩溃（供一键检测/自动恢复阶梯使用），绝不把坏状态快照成救援点。
+      let pageBroken = false
+      try {
+        const pageText = await probeWebErrorPage(p.port)
+        if (/Failed to load plugins/i.test(pageText)) {
+          pageBroken = true
+          const issues = rescue.diagnoseCrash(pageText).issues
+          rescue.recordCrash(sharedRescueDir(terminalId), {
+            exitCode: null, profileDir: p.profileDir, dshDir: p.dshDir, issues,
+            logTail: pageText.split(/\r?\n/).filter(l => /failed to import|Failed to load/i.test(l)).slice(0, 10),
+          })
+          pushTerminalLog(terminalId, 'warn', 'DSH 已启动但插件加载失败（web 可访问但页面为错误页）：已记录到救援崩溃记录，可用「救援 → 一键检测」查看并修复')
+        }
+      } catch { /* 错误页探测失败不阻断就绪 */ }
       // 成功启动 = 新的好状态：重置自动恢复阶梯，下次崩溃重新从 L1 走；同时自动刷新救援点
       runtime.autoFixLevel = 0
       runtime.autoRestartCount = 0
       // DSH 成功启动 = 一个"好点"：自动更新本终端救援点（快照当前 profile，含所有好插件）。
       // 装坏插件导致启动失败时不会走到这里，救援点仍停在"装坏插件之前"的好状态。
-      try {
-        rescue.markCrashRecovered(sharedRescueDir(terminalId))
-        const rescuePoint = rescue.createRescueSnapshot(p.profileDir, sharedRescueDir(terminalId))
-        if (rescuePoint.ok) emitTerminalSnapshot()
-      } catch { /* 快照失败不阻断就绪结果 */ }
+      // ★ 1.5.6：页面为插件失败错误页时【不是好点】——只记崩溃，不标记恢复、不建救援点。
+      if (!pageBroken) {
+        try {
+          rescue.markCrashRecovered(sharedRescueDir(terminalId))
+          const rescuePoint = rescue.createRescueSnapshot(p.profileDir, sharedRescueDir(terminalId))
+          if (rescuePoint.ok) emitTerminalSnapshot()
+        } catch { /* 快照失败不阻断就绪结果 */ }
+      }
       if (state.settings.autoOpen && startOptions.autoOpen !== false && noOpen) {
         // 只对「用户主动启动」自动开网页；崩溃自动重启等后台拉起不重复弹网页。
         // noOpen=false（DSH 不支持 --no-open）时 DSH 可能自己开浏览器，跳过 autoOpen 防双开。
@@ -2035,12 +2110,28 @@ async function connectDshDirectory(dshDirInput, sourceType = 'manual', options =
   const attachedNow = runtime && runtime.state === 'attached-running' && runtime.ownership === 'attached'
   // 接入的是运行中的正常 DSH：自动备份当前 profile 作为救援点（正常状态 = 好点）。
   // 由启动器启动的终端在每次成功启动时自动更新救援点；attached 接入不经过启动流程，这里补上。
+  // ★ 1.5.6：接入前先探测错误页 —— "活着但坏着"（插件加载失败页）的 DSH 不是好点，
+  //   记崩溃、不建救援点，让「一键检测」能立刻看到真实问题。
   if (attachedNow) {
+    let pageBroken = false
     try {
-      rescue.markCrashRecovered(sharedRescueDir(id))
-      const rescuePoint = rescue.createRescueSnapshot(terminalPaths(id).profileDir, sharedRescueDir(id))
-      if (rescuePoint.ok) emitTerminalSnapshot()
-    } catch { /* 快照失败不阻断接入 */ }
+      const pageText = await probeWebErrorPage(port)
+      if (/Failed to load plugins/i.test(pageText)) {
+        pageBroken = true
+        const issues = rescue.diagnoseCrash(pageText).issues
+        rescue.recordCrash(sharedRescueDir(id), {
+          exitCode: null, profileDir: terminalPaths(id).profileDir, dshDir: inspected.dir, issues, logTail: [],
+        })
+        pushLog('warn', '接入的 DSH 正在运行但插件加载失败（错误页）：已记录到救援崩溃记录，可在「救援 → 一键检测」查看并修复')
+      }
+    } catch { /* 错误页探测失败不阻断接入 */ }
+    if (!pageBroken) {
+      try {
+        rescue.markCrashRecovered(sharedRescueDir(id))
+        const rescuePoint = rescue.createRescueSnapshot(terminalPaths(id).profileDir, sharedRescueDir(id))
+        if (rescuePoint.ok) emitTerminalSnapshot()
+      } catch { /* 快照失败不阻断接入 */ }
+    }
   }
   return {
     ok: true,
@@ -3025,6 +3116,13 @@ function registerIpc() {
     const crash = status.lastCrash || null
     const crashFresh = crash && !crash.recoveredAt && (Date.now() - Number(crash.at || 0)) < 24 * 60 * 60 * 1000
     if (crashFresh && Array.isArray(crash.issues) && crash.issues.length) {
+      // ★ 1.5.6：client-module-missing 按安装形态路由（源码形态改重建源码）
+      try {
+        const p0 = terminalPaths(id)
+        if (p0 && p0.dshDir && fs.existsSync(path.join(p0.dshDir, 'apps', 'cli'))) {
+          for (const issue of crash.issues) if (issue.type === 'client-module-missing') issue.fix = 'rebuild-source'
+        }
+      } catch { /* 形态探测失败保持默认 */ }
       return ok({ issues: crash.issues, crash, source: 'last-crash' }, '检测到上一次崩溃记录')
     }
     const lines = readTerminalLogTail(id)
@@ -3054,6 +3152,32 @@ function registerIpc() {
           }
         }
         if (probeIssues.length) result.source = 'current-log + diagnostic-probe'
+      }
+    }
+    // ★ 1.5.6：主动探测运行中 web 的错误页 —— "活着但坏着"的插件加载失败在日志里 0 输出
+    //   （实机教训：loader entry 错误只渲染进页面），仅读日志会误报"没有任何问题"。
+    if (p && p.port) {
+      try {
+        const pageText = await probeWebErrorPage(p.port)
+        if (/Failed to load plugins/i.test(pageText)) {
+          const pageIssues = rescue.diagnoseCrash(pageText).issues
+          const seen = new Set(result.issues.map(i => `${i.type}:${i.plugin}`))
+          for (const issue of pageIssues) {
+            const key = `${issue.type}:${issue.plugin}`
+            if (!seen.has(key)) { seen.add(key); result.issues.push(issue) }
+          }
+          if (pageIssues.length) result.source = result.source ? `${result.source} + web-page` : 'web-page'
+        }
+      } catch { /* 页面探测失败不影响日志诊断结果 */ }
+    }
+    // ★ 1.5.6：client-module-missing 按安装形态路由修复动作 —— 源码形态重装依赖修不了
+    //   （包本来就齐，缺的是构建产物），必须重建源码；npm 形态保持重装 profile 依赖。
+    if (p && p.dshDir) {
+      const isSourceForm = fs.existsSync(path.join(p.dshDir, 'apps', 'cli'))
+      if (isSourceForm) {
+        for (const issue of result.issues) {
+          if (issue.type === 'client-module-missing') issue.fix = 'rebuild-source'
+        }
       }
     }
     if (!result.issues.length && crash && crash.issues && crash.issues.length) {

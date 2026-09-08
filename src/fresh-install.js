@@ -31,6 +31,35 @@ const SOURCE_TIMEOUT_MS = 3000
 // 8.3 短路径（如 C:\Users\FUTURE~1），node ESM loader 对短路径解析模块失败
 // （ERR_MODULE_NOT_FOUND: .../pnpm.mjs，用户朋友机器实测）。统一用 fs.realpathSync
 // 展开成完整长路径，所有工具（pnpm/npm/git/node）都用长路径，绝不使用短路径。
+// 安装包内嵌工具目录（extraResources: tool-bundle → resources/tools）。非打包运行（npm start）返回 ''。
+function embeddedToolsDir() {
+  try {
+    const res = process.resourcesPath || ''
+    return res ? path.join(res, 'tools', 'zat-tools') : ''
+  } catch { return '' }
+}
+
+// ★ 1.5.6：安装包内嵌工具播种到永久缓存（node/git/pnpm 随启动器发布，首启只做本地复制，绝不联网）。
+//   1.5.5 的播种代码被误放在 normalToolsDir() 的 return 之后 = 永远不执行的死代码，内嵌工具从未生效
+//   （实机症状：zat-tools 里 node/pnpm 齐全、唯独 git 没播种 → 每次启动都联网下载 PortableGit，断网即全挂）。
+//   按【单工具目录】补缺：缓存里已有哪个工具就跳过哪个，只复制缺失的；已存在绝不覆盖。
+//   半截复制/损坏残留由各 ensure* 的自检（probe）删目录后走 ensureGit 等的重播种或联网兜底自愈。
+function seedEmbeddedTools(persistentZat, onlyName = '') {
+  try {
+    const embedded = embeddedToolsDir()
+    if (!embedded || !fs.existsSync(embedded)) return
+    fs.mkdirSync(persistentZat, { recursive: true })
+    const names = onlyName ? [onlyName] : fs.readdirSync(embedded)
+    for (const name of names) {
+      const src = path.join(embedded, name)
+      if (!fs.existsSync(src) || !fs.statSync(src).isDirectory()) continue
+      const dest = path.join(persistentZat, name)
+      if (fs.existsSync(dest)) continue
+      fs.cpSync(src, dest, { recursive: true })
+    }
+  } catch { /* 播种失败仍走正常自举/联网兜底 */ }
+}
+
 function normalToolsDir() {
   // 永久缓存，不再放 %TEMP%：Windows 清临时目录后工具会“丢”，下次又自动下载。
   const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
@@ -43,20 +72,12 @@ function normalToolsDir() {
       try { fs.renameSync(old, base) } catch { fs.cpSync(old, base, { recursive: true, force: true }) }
     }
   } catch { /* 迁移失败则正常创建新目录 */ }
+  // ★ 内嵌播种必须在 return 之前执行（1.5.5 曾写在 return 之后 = 死代码，见 seedEmbeddedTools 注释）
+  seedEmbeddedTools(path.join(base, 'zat-tools'))
   try {
     fs.mkdirSync(base, { recursive: true })
     return fs.realpathSync(base)
   } catch { return base }
-  // 安装包内嵌工具优先播种到永久缓存：node/git/pnpm 随启动器发布，
-  // 首启只做本地复制，绝不联网下载。
-  try {
-    const embedded = process.resourcesPath ? path.join(process.resourcesPath, 'tools', 'zat-tools') : ''
-    const persistent = path.join(base, 'zat-tools')
-    if (embedded && fs.existsSync(embedded) && !fs.existsSync(persistent)) {
-      fs.mkdirSync(path.dirname(persistent), { recursive: true })
-      fs.cpSync(embedded, persistent, { recursive: true, force: true })
-    }
-  } catch { /* 内嵌播种失败仍走正常自举 */ }
 }
 
 // 原生模块（fs-ext 等）postinstall 用 node-gyp 编译，必须能找到可用的 Python。
@@ -770,6 +791,15 @@ async function pickRegistry(nodeExe, execute = run) {
 //   每版体检（npmCliHealthy）不过自动换下一版；npm 12 若遇新问题，回退链稳稳保住。
 async function ensureNpmCli({ nodeExe, toolsDir, onProgress, execute = runWithProgress }) {
   const dir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
+  // ★ 1.5.6：内嵌 node 发行版自带 npm（随安装包播种到 zat-tools\node）——自带优先，
+  //   离线白板机也能用 npm，不再依赖 registry 探测/下载（自带体检不过才走下载）。
+  try {
+    const embeddedNpmCli = path.join(dir, 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    if (fs.existsSync(embeddedNpmCli) && await npmCliHealthy(nodeExe, embeddedNpmCli)) {
+      if (onProgress) onProgress('依赖', 'npm CLI：使用安装包内嵌 node 自带的 npm')
+      return embeddedNpmCli
+    }
+  } catch { /* 内嵌 npm 不可用则走下载流程 */ }
   let versionsToTry = ['12.0.2', '11.3.0']
   try {
     const latest = await latestNpmCLIVersion(nodeExe, dir)
@@ -925,8 +955,17 @@ function gitPortableUrls(tag, ver) {
 // ★ 1.5.3 用户原则：findSystemGit 已删除——自带 PortableGit 齐全就用自带，绝不找用户系统 git。
 //   （旧实现 locate 系统 PATH/常见位置，与"只用自带"冲突；已改 ensureGit 直接自举下载。）
 
+// ★ 1.5.6：git 自举单飞——启动/引擎下载/更新检查/救援诊断并发触发时共享同一次自举，
+//   绝不并发跑多轮 6 镜像下载互踩（1.5.5 实机日志可见多组 1/6~6/6 交错，网络雪上加霜）。
+let gitBootstrapInFlight = null
+function ensureGit(opts) {
+  if (gitBootstrapInFlight) return gitBootstrapInFlight
+  gitBootstrapInFlight = Promise.resolve(ensureGitOnce(opts)).finally(() => { gitBootstrapInFlight = null })
+  return gitBootstrapInFlight
+}
+
 // 自举 PortableGit：下载 .7z.exe 自解压包并静默解压（-y -gm2 -o"<dir>"），然后清理自解压壳。
-async function ensureGit({ toolsDir, onProgress, execute = run }) {
+async function ensureGitOnce({ toolsDir, onProgress, execute = run }) {
   try {
     const dir = toolsDir || path.join(normalToolsDir(), 'zat-tools')
     const gitDir = path.join(dir, 'git')
@@ -944,8 +983,18 @@ async function ensureGit({ toolsDir, onProgress, execute = run }) {
       if (onProgress) onProgress('git', '缓存 PortableGit 自检失败，重新自举…')
       try { fs.rmSync(gitDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
     }
-    // ★ 1.5.3 用户原则：自带齐全就用自带，绝不摸用户系统——自带 PortableGit 缺失时
-    //   直接自举下载官方 PortableGit（多镜像），不再 findSystemGit 找用户 git。
+    // ★ 1.5.6：先从安装包内嵌副本播种（本地复制，秒级），联网下载只作最后兜底——
+    //   断网/镜像全挂的机器上自带的 git 就是唯一生命线，绝不能跳过。
+    seedEmbeddedTools(dir, 'git')
+    if (fs.existsSync(gitExe) && await probeGit(gitExe)) {
+      if (onProgress) onProgress('git', `PortableGit 就绪（安装包内嵌播种）：${gitExe}`)
+      return gitExe
+    }
+    if (fs.existsSync(gitExe)) {
+      try { fs.rmSync(gitDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
+    }
+    // ★ 1.5.3 用户原则：自带齐全就用自带，绝不摸用户系统——内嵌副本也没有时
+    //   才自举下载官方 PortableGit（多镜像），不再 findSystemGit 找用户 git。
     fs.mkdirSync(dir, { recursive: true })
     // ★ 1.4.2：跟随官方 latest（失败回退内置 2.47.1 列表）
     let urls = gitPortableUrls(GIT_BUILTIN_TAG, GIT_BUILTIN_VER)
@@ -1580,6 +1629,7 @@ module.exports = {
   ensureNpmCli, installOfficialPackage, updateNpmPackage, installProfileBundles,
   ensureNodeExe, findCachedNode, patchDshSubprocessNoWindow, ensureNpmCommand, ensureUpdateToolchain,
   ensureGit, executablePnpm, ensureConsoleHostDll, spawnWithHiddenConsole, normalToolsDir,
+  embeddedToolsDir, seedEmbeddedTools,
   findNodeGypPython,
   GIT_MIRRORS: gitPortableUrls, gitPortableUrls,
   executablePnpmOrRaw,

@@ -1,5 +1,5 @@
 {
   "version": "1.5.5",
   "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.5/ZAT-DSH-Launcher-Setup-1.5.5.exe",
-  "notes": "v1.5.5：Node/Python运行所需的 git/pnpm/node/npm 随启动器安装包内嵌发布，首启从包内本地播种到永久缓存，不再联网下载；已有自带工具时不再探测上游最新版。"
+  "notes": "v1.5.5（修复重发）：修复内嵌工具播种被写在 return 之后从未执行的死代码——内嵌 git/node/pnpm/npm 现在真正首启本地播种，断网不再联网下载；git/工具链自举单飞防并发互踩；引擎下载限时不再阻塞启动；救援新增 web 错误页探测（插件加载失败页不再漏检、不再把坏状态快照成救援点）；崩溃诊断新增原生依赖未编译与客户端模块缺失分类（源码形态自动路由重建源码）。"
 }

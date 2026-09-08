@@ -24,10 +24,15 @@ const tryRemove = (p, label) => {
   }
 }
 
+// ★ 发布产物名已统一为 ASCII（与 GitHub release 资产/下载链接一致）：ZAT-DSH-Launcher-*。
+//   旧前缀（ZAT启动器-便携版- / ZAT启动器 Setup ）一并保留匹配，清掉历史版本残骸。
+const OLD_PREFIXES = ['ZAT启动器-便携版-', 'ZAT启动器 Setup ']
+const isOldArtifact = (name) => OLD_PREFIXES.some(p => name.startsWith(p)) && (name.endsWith('.exe') || name.endsWith('.exe.blockmap') || name.includes('便携版'))
+
 for (const name of fs.readdirSync(root)) {
   if (name.includes(version)) continue // 保留当前版本
-  if (name.startsWith('ZAT启动器-便携版-')) tryRemove(path.join(root, name), name)
-  else if (name.startsWith('ZAT启动器 Setup ') && (name.endsWith('.exe') || name.endsWith('.exe.blockmap'))) tryRemove(path.join(root, name), name)
+  if (name.startsWith('ZAT-DSH-Launcher-')) tryRemove(path.join(root, name), name)
+  else if (isOldArtifact(name)) tryRemove(path.join(root, name), name)
 }
 
 if (locked.length) console.log(`清理完成（${removed} 项）。以下正被运行锁住，未能删除：${locked.join('、')}`)
