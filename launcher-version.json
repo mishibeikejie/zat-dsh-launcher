@@ -1,5 +1,5 @@
 {
-  "version": "1.5.4",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.4/ZAT-DSH-Launcher-Setup-1.5.4.exe",
-  "notes": "v1.5.4 修复：原生依赖（fs-ext 等）node-gyp 编译时自动探测并注入机器上的 Python（含 Python 3.14），不再因找不到 Python 导致 profile bundle 安装失败与 DSH 启动崩溃。"
+  "version": "1.5.5",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.5/ZAT-DSH-Launcher-Setup-1.5.5.exe",
+  "notes": "v1.5.5：Node/Python运行所需的 git/pnpm/node/npm 随启动器安装包内嵌发布，首启从包内本地播种到永久缓存，不再联网下载；已有自带工具时不再探测上游最新版。"
 }

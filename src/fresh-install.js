@@ -47,6 +47,16 @@ function normalToolsDir() {
     fs.mkdirSync(base, { recursive: true })
     return fs.realpathSync(base)
   } catch { return base }
+  // 安装包内嵌工具优先播种到永久缓存：node/git/pnpm 随启动器发布，
+  // 首启只做本地复制，绝不联网下载。
+  try {
+    const embedded = process.resourcesPath ? path.join(process.resourcesPath, 'tools', 'zat-tools') : ''
+    const persistent = path.join(base, 'zat-tools')
+    if (embedded && fs.existsSync(embedded) && !fs.existsSync(persistent)) {
+      fs.mkdirSync(path.dirname(persistent), { recursive: true })
+      fs.cpSync(embedded, persistent, { recursive: true, force: true })
+    }
+  } catch { /* 内嵌播种失败仍走正常自举 */ }
 }
 
 // 原生模块（fs-ext 等）postinstall 用 node-gyp 编译，必须能找到可用的 Python。
@@ -206,6 +216,24 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run, skipOn
   const dir = (() => { try { fs.mkdirSync(rawDir, { recursive: true }); return fs.realpathSync(rawDir) } catch { return normalToolsDir() + '\\zat-tools' } })()
   const cached = path.join(dir, 'pnpm.mjs')
   const nodeBin = nodeExe && nodeExe !== 'pnpm' ? nodeExe : 'node'
+  // ★ 用户原则：已有自带 pnpm（standalone/cjs）就绝不再联网探测/下载。
+  try {
+    const own = (() => {
+      try {
+        const dirs = fs.readdirSync(dir).filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && fs.existsSync(path.join(dir, n, 'pnpm.exe'))).sort()
+        if (dirs.length) return path.join(dir, dirs[dirs.length - 1], 'pnpm.exe')
+      } catch { /* 目录不可读则跳过 */ }
+      for (const name of ['pnpm.exe', 'pnpm.cjs']) {
+        const p = path.join(dir, name)
+        if (fs.existsSync(p)) return p
+      }
+      return ''
+    })()
+    if (own) {
+      if (onProgress) onProgress('依赖', `复用自带 pnpm（${own}），不联网`)
+      return own
+    }
+  } catch { /* 探测失败仍走在线/兜底 */ }
   // ★ 1.4.2 根修（权威结论见 PNPM_VERIFIED_VERSIONS）：主路径 = 官方 standalone pnpm.exe
   //   （仅已验证版本白名单，下载 zip→解压→体检），内置 mjs 仅作网络全挂的兜底。
   try {

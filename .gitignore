@@ -26,3 +26,7 @@ Thumbs.db
 
 # TEMP 变量未展开的路径残骸（测试脚本误生成，非项目文件）
 Users*
+
+# 构建期本地工具包（node/git/pnpm 二进制，不入库）
+tool-bundle/
+tool-stage/
