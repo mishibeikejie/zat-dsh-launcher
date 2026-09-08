@@ -277,8 +277,11 @@ function factoryResetProfile(profileDir, backupDir) {
         backed.push(f)
       }
     }
-    // 重建最小可用 profile：仅官方 bundle，无任何 patch / 自定义插件
-    fs.writeFileSync(path.join(profileDir, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: FACTORY_BUNDLES } } }, null, 2) + '\n', 'utf8')
+    // 重建最小可用 profile：仅官方 bundle，无任何 patch / 自定义插件。
+    // ★ 1.5.6：保留启动器自己的插件商店（zat-dsh-engine）——它是启动器基础设施而非用户的
+    //   坏插件；实机事故：工厂重置抹掉引擎注册后商店"消失"（引擎文件还在 profile 里）。
+    const engineBundles = listBundles(profileDir).filter(b => /zat-dsh-engine/i.test(String(b)))
+    fs.writeFileSync(path.join(profileDir, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: [...FACTORY_BUNDLES, ...engineBundles] } } }, null, 2) + '\n', 'utf8')
     fs.writeFileSync(path.join(profileDir, 'cordis.yml'), '[]\n', 'utf8')
     fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), '[]\n', 'utf8')
     return { ok: true, backupDir, files: backed, bundles: FACTORY_BUNDLES }

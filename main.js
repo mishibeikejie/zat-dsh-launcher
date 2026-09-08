@@ -1571,6 +1571,22 @@ async function startTerminal(terminalId, startOptions = {}) {
         emitTerminalSnapshot()
       }
     }
+  } else if (!engineInfo.mounted) {
+    // ★ 1.5.6：引擎包在但注册被抹（L3 工厂重置/旧救援点还原都会重写 package.json 丢掉
+    //   zat-dsh-engine bundle）→ 本地重新注入声明，不重新下载。实机事故：插件商店"消失"。
+    pushTerminalLog(terminalId, 'info', '检测到插件商店文件在但未注册（注册被还原/重置抹除），本地补注册…')
+    try {
+      engineManager.injectEngine(engineProfileDir)
+      const verified = engineManager.verifyEngine(engineProfileDir)
+      if (verified.ok) {
+        pushTerminalLog(terminalId, 'info', '插件商店注册已恢复')
+        emitTerminalSnapshot()
+      } else {
+        pushTerminalLog(terminalId, 'warn', `插件商店注册恢复校验未通过：${verified.message || '结构异常'}（不影响本次启动）`)
+      }
+    } catch (e) {
+      pushTerminalLog(terminalId, 'warn', `插件商店注册恢复失败：${friendlyError(e)}（不影响本次启动）`)
+    }
   }
 
   runtime.starting = true

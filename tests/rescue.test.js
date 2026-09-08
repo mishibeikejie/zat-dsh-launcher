@@ -288,3 +288,19 @@ test('factoryResetProfile backs up configs and writes minimal usable profile (L3
     assert.ok(!fs.readFileSync(path.join(profile, 'cordis.yml'), 'utf8').includes('bad-plugin'))
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('factoryResetProfile keeps the launcher engine (zat-dsh-engine) registered (1.5.6 实机事故)', () => {
+  const dir = tmp('l3engine')
+  try {
+    const profile = path.join(dir, 'profiles', 'web')
+    const backup = path.join(dir, 'factory-backups')
+    fs.mkdirSync(profile, { recursive: true })
+    fs.writeFileSync(path.join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'zat-dsh-engine', 'bad-plugin'] } } }, null, 2))
+    const r = factoryResetProfile(profile, backup)
+    assert.equal(r.ok, true)
+    const pkg = JSON.parse(fs.readFileSync(path.join(profile, 'package.json'), 'utf8'))
+    // 坏插件被清掉，但启动器自己的插件商店必须保留
+    assert.deepEqual(pkg.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'zat-dsh-engine'])
+    assert.ok(!pkg.dsh.profile.bundles.includes('bad-plugin'))
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})

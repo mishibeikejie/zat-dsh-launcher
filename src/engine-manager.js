@@ -232,7 +232,11 @@ function injectEngine(profileDir, { mirror = 'https://gh-proxy.com/', supported 
   // 双轨注入：bundle 注册 + patch 兜底
   const bundles = addEngineBundle(profileDir)
   if (!current.includes(PATCH_ROW_ID) && !current.includes('zat-dsh-engine')) {
-    fs.writeFileSync(patchFile, `${current.trimEnd()}\n${enginePatchBlock(mirror)}`, 'utf8')
+    // ★ 1.5.6：现有内容为空/`[]` 时不能拼接——`[]` 后跟 `- insert:` 是非法 YAML，
+    //   DSH parsePatchList 直接启动失败（实机事故）。空文件/空数组一律以 patch 块为新文档。
+    const trimmed = String(current || '').trim()
+    const base = trimmed && trimmed !== '[]' ? `${trimmed}\n` : ''
+    fs.writeFileSync(patchFile, `${base}${enginePatchBlock(mirror)}`, 'utf8')
   }
   return { ok: true, mounted: true, injected: true, patchFile, bundles, message: '已注入 zat-dsh-engine（bundle 注册 + patch 兜底，均已备份）' }
 }
