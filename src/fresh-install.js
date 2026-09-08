@@ -32,8 +32,21 @@ const SOURCE_TIMEOUT_MS = 3000
 // （ERR_MODULE_NOT_FOUND: .../pnpm.mjs，用户朋友机器实测）。统一用 fs.realpathSync
 // 展开成完整长路径，所有工具（pnpm/npm/git/node）都用长路径，绝不使用短路径。
 function normalToolsDir() {
-  const t = os.tmpdir()
-  try { return fs.realpathSync(t) } catch { return t }
+  // 永久缓存，不再放 %TEMP%：Windows 清临时目录后工具会“丢”，下次又自动下载。
+  const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+  const base = path.join(local, 'ZAT-Launcher', 'tools')
+  // 旧版本缓存在 %TEMP%\zat-tools：目标目录为空时整体迁移，避免升级后重复下载。
+  const old = path.join(os.tmpdir(), 'zat-tools')
+  try {
+    if (fs.existsSync(old) && !fs.existsSync(base)) {
+      fs.mkdirSync(path.dirname(base), { recursive: true })
+      try { fs.renameSync(old, base) } catch { fs.cpSync(old, base, { recursive: true, force: true }) }
+    }
+  } catch { /* 迁移失败则正常创建新目录 */ }
+  try {
+    fs.mkdirSync(base, { recursive: true })
+    return fs.realpathSync(base)
+  } catch { return base }
 }
 
 // 原生模块（fs-ext 等）postinstall 用 node-gyp 编译，必须能找到可用的 Python。
