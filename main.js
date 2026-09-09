@@ -2797,6 +2797,33 @@ function registerIpc() {
     // 更新成功 → 自动重启生效：用户点完「安装更新」就完事，不用再手动启动。
     // 无论更新前是否在运行，新版本都要重启进程才加载（旧进程仍是旧代码）。
     if (result.ok) {
+      // ★ 1.5.6 根修：源码（git）形态更新后必须同步 profile 依赖（bundle 与主包强制同号）——
+      //   只更源码不更 profile：服务端扫描到新客户端插件、前端还是旧版 → "Failed to load
+      //   plugins"（实机两次事故：0.1.3-alpha.2、0.1.5-alpha.1 更新后同症状）。npm 形态在
+      //   npmUpdater 里已同步，这里只补 git 形态。同步失败不阻断更新，警告 + 救援可修。
+      if (result.kind !== 'npm') {
+        try {
+          const newMainVersion = (() => {
+            try { return JSON.parse(fs.readFileSync(path.join(p.dshDir, 'package.json'), 'utf8')).version || '' } catch { return '' }
+          })()
+          if (newMainVersion) {
+            pushTerminalLog(id, 'info', `[更新] 同步 profile 依赖到 ${newMainVersion}（dsh-base / dsh-web-app 强制同号）…`)
+            const bundles = await freshInstall.installProfileBundles({
+              nodeExe: tcEnv.nodeExe || findNodeExe(),
+              profileDir: p.profileDir,
+              toolsDir: path.join(freshInstall.normalToolsDir(), 'zat-tools'),
+              onProgress: (stage, message) => pushTerminalLog(id, 'info', `[${stage}] ${message}`),
+              execute: updateExecute,
+              force: true,
+              version: newMainVersion,
+            })
+            if (bundles.ok) pushTerminalLog(id, 'info', `[更新] profile 依赖已同步到 ${newMainVersion}`)
+            else pushTerminalLog(id, 'warn', `[更新] profile 依赖同步失败：${bundles.message}（新版本若报"插件加载失败"，用「救援 → 一键检测」修复）`)
+          }
+        } catch (e) {
+          pushTerminalLog(id, 'warn', `[更新] profile 依赖同步异常：${friendlyError(e)}（不影响源码更新本身）`)
+        }
+      }
       pushTerminalLog(id, 'info', '更新完成，自动重启终端使新版本生效…')
       const stopped = await stopTerminal(id, { confirmAttached: true, silent: true })
       if (!stopped.ok && stopped.message) pushTerminalLog(id, 'warn', `停止旧进程：${stopped.message}`)
