@@ -382,3 +382,50 @@ test('supervisor accumulates runtime independently per terminal', async () => {
     supervisor.dispose()
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('uptime 只算当前真实运行：累计 activeMs 绝不混入（1.5.7 显示真实性根修）', async () => {
+  const { dir, registry } = temporaryRegistry()
+  try {
+    const a = registry.add({ port: 3082, dshDir: 'D:\\dsh-c' })
+    // 进程真实启动时刻 = 3 分钟前（模拟 DSH 刚起），而历史累计 activeMs = 50 小时
+    const processStart = Date.now() - 3 * 60 * 1000
+    const supervisor = new TerminalSupervisor({
+      registry,
+      probePort: async () => true,
+      probeHttp: async () => ({ healthy: true, harness: true, statusCode: 200 }),
+      resolvePortPid: async () => 4321,
+      resolveProcessStart: async () => processStart,
+    })
+    supervisor.restoreActiveMs(a.id, 50 * 60 * 60 * 1000) // 50 小时累计
+    await supervisor.check(a.id)
+    const r = supervisor.publicRuntime(a.id)
+    assert.equal(r.running, true)
+    // 核心断言：uptime 必须是 3 分钟量级（真实本轮），绝不是 50 小时累计
+    assert.ok(r.uptimeMs >= 2.5 * 60 * 1000 && r.uptimeMs < 5 * 60 * 1000, `uptime 应约 3 分钟，实际 ${Math.round(r.uptimeMs / 60000)} 分钟`)
+    assert.ok(r.activeMs >= 50 * 60 * 60 * 1000, 'activeMs 仍保留累计（内部统计用）')
+    // 停止后 uptime 归零，绝不显示历史值
+    supervisor.setTransition(a.id, { state: 'stopped' })
+    const stopped = supervisor.publicRuntime(a.id)
+    assert.equal(stopped.uptimeMs, 0)
+    supervisor.dispose()
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('uptime 拿不到进程启动时刻时退回首次观察时刻（绝不显示累计）', async () => {
+  const { dir, registry } = temporaryRegistry()
+  try {
+    const a = registry.add({ port: 3083, dshDir: 'D:\\dsh-d' })
+    const supervisor = new TerminalSupervisor({
+      registry,
+      probePort: async () => true,
+      probeHttp: async () => ({ healthy: true, harness: true, statusCode: 200 }),
+      resolvePortPid: async () => null,
+      resolveProcessStart: async () => 0,
+    })
+    supervisor.restoreActiveMs(a.id, 44 * 60 * 60 * 1000) // 44 小时累计
+    await supervisor.check(a.id)
+    const r = supervisor.publicRuntime(a.id)
+    assert.ok(r.uptimeMs < 60 * 1000, `无启动时刻时应只显示刚观察到的秒级时长，实际 ${Math.round(r.uptimeMs / 1000)} 秒`)
+    supervisor.dispose()
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})

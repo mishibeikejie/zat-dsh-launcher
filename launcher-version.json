@@ -1,5 +1,5 @@
 {
-  "version": "1.5.6",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.6/ZAT-DSH-Launcher-Setup-1.5.6.exe",
-  "notes": "v1.5.6：DSH 新版本检测根修——版本基准回归 DSH 仓库 GitHub Releases（发布日最新 tag，不管叫 alpha/rc 还是换任何名，出了 release 就必须检测到）；预发布排序修正（alpha < beta < rc < 正式版，旧实现 0.1.5-alpha.2 被误判大于 0.1.5-rc.1 导致 0.1.5-rc.1 检测不到）；安装/更新目标直接跟仓库 release 走。"
+  "version": "1.5.7",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.7/ZAT-DSH-Launcher-Setup-1.5.7.exe",
+  "notes": "v1.5.7 显示真实性根修：① 运行时长只算当前这一轮真实运行——以操作系统进程启动时刻起算（跨启动器重启、跨开机都真实），旧实现把跨天累计值当运行时长显示（实测开机当天却显示 1天20小时）；② 异常状态如实显示——端口冲突/状态异常/启动失败/未配置 不再糊成「未运行 · 端口空闲 · 就绪」，标题栏同步变红/黄；③ attached 终端如实显示进程 PID（不再显示「检测中」）。"
 }

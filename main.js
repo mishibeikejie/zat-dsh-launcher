@@ -582,10 +582,12 @@ function migrateRescuePointsFromPreviousVersions() {
 }
 
 function supervisorStatusForUi(runtime) {
+  // pid 取值与 publicRuntime 一致（attached 场景 pid 来自监听端口解析，别让 UI 显示"检测中"）
+  const pid = runtime.pid || runtime.listeningPid || null
   return {
     running: runtime.state === 'running' || runtime.state === 'attached-running',
-    pids: runtime.pid ? [runtime.pid] : [],
-    childPid: runtime.pid || null,
+    pids: pid ? [pid] : [],
+    childPid: pid,
     starting: ['starting', 'waiting-port', 'checking-http'].includes(runtime.state),
     stopping: runtime.state === 'stopping',
     state: runtime.state,
@@ -595,7 +597,9 @@ function supervisorStatusForUi(runtime) {
     lastCheckedAt: runtime.lastCheckedAt,
     activeMs: runtime.activeMs || 0,
     activeSince: runtime.activeSince || 0,
-    uptimeMs: (runtime.activeMs || 0) + (runtime.activeSince ? Date.now() - runtime.activeSince : 0),
+    // ★ 1.5.7：uptime 只用【当前这一轮真实运行】的时长（publicRuntime 已按 OS 进程启动时刻算好），
+    //   绝不再把跨会话累计 activeMs 当运行时长（用户实测"开机当天显示 1天20小时"的根因）。
+    uptimeMs: Number.isFinite(Number(runtime.uptimeMs)) ? Number(runtime.uptimeMs) : 0,
   }
 }
 
@@ -665,6 +669,9 @@ function initializeTerminalSupervisor() {
     resolvePortPid: async (port) => { const pids = await listPortPids(port); return pids[0] || null },
     // ★ 1.3.1：按进程 cmdline 识别 DSH（HTTP 标记识别不到时兜底，见 terminal-supervisor check）
     identifyHarness: identifyHarnessPid,
+    // ★ 1.5.7：真实进程启动时刻（OS CreationDate → epoch ms）——运行时长以它起算，跨启动器重启/
+    //   重启电脑都真实；查不到返回 0（调用方退回"首次观察到运行"的时刻）。
+    resolveProcessStart: resolveProcessStartMs,
   })
   for (const terminal of terminalRegistry.list()) loadTerminalLogHistory(terminal.id)
   for (const terminal of terminalRegistry.list()) {
@@ -1331,6 +1338,24 @@ const HARNESS_CMDLINE_RE = /(bin\.[jt]s[\s"']+web(?![\w-])|deepseek[-_]harness|@
 // ★ 1.4.0（F08/F11）：identifyHarness 按 pid 做 30 秒 TTL 缓存——进程 cmdline 不变，
 //   缓存消除 port-conflict 期间每 2 秒一轮的 powershell 拉起（CPU/能耗 churn）
 const harnessPidCache = new Map() // pid -> { ok, at }
+// ★ 1.5.7：真实进程启动时刻（OS CreationDate → epoch ms）。运行时长以它起算——跨启动器重启、
+//   跨开机都真实（用户实测"开机当天却显示 1天20小时"= 旧实现拿跨会话累计值当运行时长）。
+//   缓存 10 分钟：同一 pid 的启动时刻不会变，避免监控每 2 秒拉一次 PowerShell。
+const procStartCache = new Map() // pid -> { at, startMs }
+function resolveProcessStartMs(pid) {
+  return new Promise(resolve => {
+    if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return resolve(0)
+    const cached = procStartCache.get(Number(pid))
+    if (cached && Date.now() - cached.at < 10 * 60 * 1000) return resolve(cached.startMs)
+    const ps = `$p = Get-Process -Id ${Number(pid)} -ErrorAction SilentlyContinue; if ($p) { [DateTimeOffset]$p.StartTime | ForEach-Object { $_.ToUnixTimeMilliseconds() } }`
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 8000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+      const ms = Number(String(stdout || '').trim())
+      const ok = !error && Number.isFinite(ms) && ms > 0
+      procStartCache.set(Number(pid), { at: Date.now(), startMs: ok ? ms : 0 })
+      resolve(ok ? ms : 0)
+    })
+  })
+}
 function identifyHarnessPid(pid) {
   return new Promise(resolve => {
     if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return resolve(false)

@@ -95,8 +95,21 @@ function renderStatus(s) {
   const port = currentPort()
   const pidText = s.pid || (s.pids || [])[0] || (s.ownership === 'attached' ? '外部接入' : '检测中')
   const uptime = formatDuration(s.uptimeMs)
-  els.status.textContent = running ? `运行中 · 端口 ${port}` : (s.starting ? '正在启动' : s.stopping ? '正在停止' : '未运行')
-  els.detail.textContent = running ? `进程 ${pidText}` : `端口 ${port} ${s.starting ? '启动中' : '空闲'}`
+  // ★ 1.5.7 显示真实性：异常状态必须如实说，绝不糊成"未运行 · 端口空闲 · 就绪"
+  //   （端口被非 Harness 服务占用时说"空闲"、进程死了说"就绪"都是骗人）
+  const st = String(s.state || '')
+  const abnormal = st === 'port-conflict' ? { text: '端口冲突', detail: `端口 ${port} 被非 Harness 服务占用`, pill: '端口冲突', cls: 'pill-error' }
+    : st === 'degraded' ? { text: '状态异常', detail: `进程已退出或异常（端口 ${port}）`, pill: '状态异常', cls: 'pill-warn' }
+      : st === 'failed' ? { text: '启动失败', detail: `启动失败（端口 ${port}），可在救援中检测修复`, pill: '启动失败', cls: 'pill-error' }
+        : st === 'unconfigured' ? { text: '未配置', detail: `端口 ${port} 尚未配置 DSH`, pill: '未配置', cls: 'pill-warn' }
+          : null
+  els.status.textContent = running ? `运行中 · 端口 ${port}`
+    : s.starting ? '正在启动'
+      : s.stopping ? '正在停止'
+        : abnormal ? abnormal.text : '未运行'
+  els.detail.textContent = running ? `进程 ${pidText}`
+    : abnormal ? abnormal.detail
+      : `端口 ${port} ${s.starting ? '启动中' : '空闲'}`
   // 转圈已移除（被打赏二维码卡片取代），仅保留状态容器 class 以兼容旧逻辑
   if (els.orb) els.orb.className = `runtime-orb ${running ? 'running' : s.starting ? 'starting' : ''}`
   // 光环随运行状态柔和呼吸（形象保持静止，等待真实帧动画素材）
@@ -105,8 +118,12 @@ function renderStatus(s) {
   // 大肥鱼：运行中走路帧循环，停止时静止帧
   setMascotMotion(running ? 'running' : 'idle')
   // 运行时长只显示在标题栏 pill 一处（每个终端各显示各的），避免与侧边栏重复
-  els.pill.textContent = running ? (uptime ? `运行中 · ${uptime}` : '运行中') : s.starting ? '启动中' : '就绪'
-  els.footer.textContent = running ? '● 运行中' : '○ 未运行'
+  els.pill.className = `pill${abnormal && !running ? ` ${abnormal.cls}` : ''}`
+  els.pill.textContent = running ? (uptime ? `运行中 · ${uptime}` : '运行中')
+    : s.starting ? '启动中'
+      : s.stopping ? '停止中'
+        : abnormal ? abnormal.pill : '就绪'
+  els.footer.textContent = running ? '● 运行中' : abnormal ? `! ${abnormal.text}` : '○ 未运行'
   els.start.disabled = running || s.starting || s.stopping; els.stop.disabled = (!running && !s.starting && !s.pid && !s.childPid) || s.stopping; els.restart.disabled = s.starting || s.stopping || !running
 }
 function renderEnvs(list, current) {

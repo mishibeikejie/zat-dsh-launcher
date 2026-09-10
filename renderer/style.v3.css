@@ -63,6 +63,9 @@ img{user-select:none;-webkit-user-drag:none}
   padding:4px 12px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.3px;
   background:var(--blue-soft);color:var(--blue-deep);border:1px solid rgba(77,107,254,.14);
 }
+/* ★ 1.5.7：异常状态如实着色（端口冲突/启动失败=红，状态异常/未配置=黄） */
+.pill-warn{background:#fff3dc;color:#9d691c;border-color:rgba(157,105,28,.25)}
+.pill-error{background:#fee9ed;color:var(--danger);border-color:rgba(220,70,82,.28)}
 .clock{font:12px var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
 .win-controls{display:flex;align-items:center;gap:4px}
 .win-btn{

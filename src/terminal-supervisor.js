@@ -66,6 +66,10 @@ function initialRuntime(terminalId) {
     lastChangedAt: Date.now(),
     activeMs: 0,
     activeSince: 0,
+    // ★ 1.5.7：真实运行时长起算点（OS 进程启动时刻）+ 对应 pid / 监听端口 pid
+    startedAt: 0,
+    startedAtPid: 0,
+    listeningPid: 0,
     logs: [],
     generation: 0,
     cancelRequested: false,
@@ -87,6 +91,8 @@ class TerminalSupervisor extends EventEmitter {
     this.probeHttp = options.probeHttp || probeHttp
     this.resolvePortPid = options.resolvePortPid || null
     this.identifyHarness = options.identifyHarness || null // (pid) => Promise<boolean>：按进程 cmdline 识别 DSH
+    // ★ 1.5.7：(pid) => Promise<number>，查 OS 真实进程启动时刻（epoch ms）——运行时长起算点
+    this.resolveProcessStart = options.resolveProcessStart || null
     this.intervalMs = options.intervalMs || 2000
     this.runtimes = new Map()
   }
@@ -101,22 +107,30 @@ class TerminalSupervisor extends EventEmitter {
 
   publicRuntime(terminalId) {
     const runtime = this.ensure(terminalId)
+    const running = runtime.state === 'running' || runtime.state === 'attached-running'
+    // ★ 1.5.7 显示真实性根修：uptime 只算【当前这一轮真实运行】——以操作系统进程启动时刻
+    //   （runtime.startedAt，由 resolveProcessStart 查真实 CreationDate 得到）为准；进程启动
+    //   时刻拿不到才退回"启动器首次观察到运行"的时刻。绝不把跨天累计的 activeMs 当运行时长
+    //   显示（用户实测：开机当天却显示 1天20小时 = 累计值，纯误导）。
+    const since = runtime.startedAt || runtime.activeSince || 0
     return {
       terminalId,
       state: runtime.state,
       ownership: runtime.ownership,
-      pid: runtime.pid,
+      pid: runtime.pid || runtime.listeningPid || null,
       portListening: runtime.portListening,
       httpHealthy: runtime.httpHealthy,
       harnessConfirmed: runtime.harnessConfirmed,
       starting: runtime.starting,
       stopping: runtime.stopping,
-      running: runtime.state === 'running' || runtime.state === 'attached-running',
+      running,
       lastCheckedAt: runtime.lastCheckedAt,
       lastChangedAt: runtime.lastChangedAt,
+      // 累计运行时长（跨会话历史，仅供内部/统计；UI 不得当"运行中时长"展示）
       activeMs: runtime.activeMs,
       activeSince: runtime.activeSince,
-      uptimeMs: runtime.activeMs + (runtime.activeSince ? Date.now() - runtime.activeSince : 0),
+      // 当前真实运行时长
+      uptimeMs: running && since ? Math.max(0, Date.now() - since) : 0,
     }
   }
 
@@ -241,9 +255,30 @@ class TerminalSupervisor extends EventEmitter {
       const runningNow = runtime.state === 'running' || runtime.state === 'attached-running'
       if (runningNow) {
         if (!runtime.activeSince) runtime.activeSince = Date.now()
-      } else if (runtime.activeSince) {
-        runtime.activeMs += Date.now() - runtime.activeSince
-        runtime.activeSince = 0
+        // ★ 1.5.7：解析【真实进程启动时刻】作为运行时长起算点（跨启动器重启/重启电脑都真实）。
+        //   只解析一次并缓存到 runtime（同一 pid 不重复查系统）；pid 变了（DSH 重启）重新解析。
+        let pid = runtime.pid || runtime.listeningPid || 0
+        if (!pid && !runtime.startedAt && this.resolvePortPid) {
+          try {
+            const p = await this.resolvePortPid(terminal.port)
+            if (Number.isSafeInteger(Number(p)) && Number(p) > 0) { pid = Number(p); runtime.listeningPid = pid }
+          } catch { /* 拿不到 pid 走观察时刻兜底 */ }
+        }
+        if (pid && runtime.startedAtPid !== pid && this.resolveProcessStart) {
+          try {
+            const startedAt = await this.resolveProcessStart(pid)
+            if (startedAt > 0) { runtime.startedAt = startedAt; runtime.startedAtPid = pid }
+          } catch { /* 查询失败退回观察时刻 */ }
+        }
+        if (!runtime.startedAt) runtime.startedAt = runtime.activeSince
+      } else {
+        if (runtime.activeSince) {
+          runtime.activeMs += Date.now() - runtime.activeSince
+          runtime.activeSince = 0
+        }
+        runtime.startedAt = 0
+        runtime.startedAtPid = 0
+        runtime.listeningPid = 0
       }
 
       this.publishIfChanged(terminalId, previousState)
