@@ -1,5 +1,5 @@
 {
-  "version": "1.5.5",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.5/ZAT-DSH-Launcher-Setup-1.5.5.exe",
-  "notes": "v1.5.5（修复重发）：内嵌工具播种死代码根修，断网开箱即用；源码形态更新锁定官方发布 tag（不再跟 master 未发布代码——本次 DSH 崩溃的根源）；救援新增带 token 的客户端模块图探测（插件加载失败页不再漏检、不再误建救援点），一键检测可定位缺失模块；崩溃诊断新增原生依赖与客户端模块缺失分类；发布产物名统一 ASCII 杜绝乱码。"
+  "version": "1.5.6",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.6/ZAT-DSH-Launcher-Setup-1.5.6.exe",
+  "notes": "v1.5.6：DSH 新版本检测根修——版本基准回归 DSH 仓库 GitHub Releases（发布日最新 tag，不管叫 alpha/rc 还是换任何名，出了 release 就必须检测到）；预发布排序修正（alpha < beta < rc < 正式版，旧实现 0.1.5-alpha.2 被误判大于 0.1.5-rc.1 导致 0.1.5-rc.1 检测不到）；安装/更新目标直接跟仓库 release 走。"
 }
