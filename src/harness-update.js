@@ -419,9 +419,12 @@ function updateSources(origin) {
   ]
 }
 
-// 版本号比较：0.1.0-rc.7 -> [0,1,0,-1,7]；数字段比较，预发布段（rc/beta/alpha）比正式段旧
+// 版本号比较：0.1.0-rc.7 -> [0,1,0,-1,7]；数字段比较，预发布段（rc/beta/alpha）比正式段旧。
+// ★ 1.5.3 排序修正：预发布类型必须有序（alpha < beta < rc < 正式版）——旧实现三者全映射 -1，
+//   '0.1.5-alpha.2' 被判大于 '0.1.5-rc.1'（尾数 2>1），直接导致 0.1.5-rc.1 检测不到。
+//   现在 alpha=-3 / beta=-2 / rc=-1（负值保持"预发布 < 正式版"的 pad-0 语义，同时类型有序）。
 function versionParts(v) {
-  return String(v || '').split(/[.\-]/).map(p => /^\d+$/.test(p) ? parseInt(p, 10) : (p === 'rc' || p === 'beta' || p === 'alpha' ? -1 : 0))
+  return String(v || '').split(/[.\-]/).map(p => /^\d+$/.test(p) ? parseInt(p, 10) : (p === 'rc' ? -1 : p === 'beta' ? -2 : p === 'alpha' ? -3 : 0))
 }
 function compareVersions(a, b) {
   const pa = versionParts(a)

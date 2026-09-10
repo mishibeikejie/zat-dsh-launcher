@@ -1463,21 +1463,35 @@ function patchDshSubprocessNoWindow(rootDir) {
   return patched
 }
 
-// 动态解析 npm 上 @deepseek-ai/dsh 的最新版本号（dist-tags 中 latest 与 next 比较取新）。
-// 用具体版本号安装/更新——pnpm 的 @next 标签解析不可靠（实测 add @next 装出旧 rc.7），
-// 而 dist-tags 始终准确（实测 latest=0.1.0-rc.7, next=0.1.0-rc.8 → 返回 rc.8）。
-// 返回版本号字符串（如 '0.1.0-rc.8'）；全部源不可达返回 ''（调用方回退标签）。
+// ★ 1.5.3 用户原则（权威基准）：DSH 版本 = DSH 仓库 GitHub Releases【发布日最新 tag】，
+//   不管它叫 alpha/beta/rc 还是以后换任何名字——tag 出了 release 就必须检测到。
+//   dist-tags 那套"拼标签取最大"彻底废弃（预发布类型排序曾被 alpha/rc 颠倒坑死）。
+// ① GitHub Releases 最新 tag（deepseek-ai/deepseek-harness，官方 → 镜像回退）
+async function resolveUpstreamDshVersion(nodeExe, timeoutMs = 6000) {
+  const script = 'fetch(process.argv[1],{headers:{"User-Agent":"zat-launcher"}}).then(r=>r.json()).then(j=>{const t=(Array.isArray(j)?j:[]).sort((a,b)=>String(b.published_at||"").localeCompare(String(a.published_at||"")))[0];if(t)console.log(String(t.tag_name||"").replace(/^dsh-v/i,""))}).catch(()=>process.exit(1))'
+  for (const url of [
+    'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=5',
+    'https://ghfast.top/https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=5',
+    'https://gh-proxy.com/https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=5',
+  ]) {
+    const r = await run(nodeExe, ['-e', script, url], null, timeoutMs)
+    if (r.ok && r.out.trim()) return r.out.trim()
+  }
+  return ''
+}
+// ② 安装/更新目标版本：上游 release 优先；GitHub 全挂才退 dist-tags（兜底通道）
 async function resolveLatestDshVersion(nodeExe, timeoutMs = 3000) {
+  try {
+    const upstream = await resolveUpstreamDshVersion(nodeExe, 6000)
+    if (upstream && /^\d/.test(upstream)) return upstream
+  } catch { /* GitHub 不可达走 dist-tags 兜底 */ }
   const script = 'fetch(process.argv[1]).then(r=>r.json()).then(j=>{console.log((j.latest||"")+" "+(j.next||"")+" "+(j.alpha||""))}).catch(()=>process.exit(1))'
-  // ★ 1.4.0：verCmp 换用 harness-update.compareVersions——旧实现 parseInt('rc')=0，
-  //   '0.1.2-rc.1' 被判大于同号正式版 '0.1.2'（语义颠倒，可能装到降级预发布版）
   const verCmp = compareVersions
   for (const base of NPM_REGISTRIES) {
     const url = `${String(base).replace(/\/$/, '')}/-/package/${DSH_NPM_PACKAGE}/dist-tags`
     const r = await run(nodeExe, ['-e', script, url], null, timeoutMs)
     if (!r.ok) continue
     const parts = r.out.trim().split(/\s+/).filter(Boolean)
-    // ★ 1.4.2：alpha 标签纳入（官方把 alpha 系列发 npm 并打 alpha 标签——不读则永远检测不到）
     const latest = parts[0] || ''
     const next = parts[1] || ''
     const alphaV = parts[2] || ''
