@@ -1,5 +1,5 @@
 {
-  "version": "1.5.7",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.7/ZAT-DSH-Launcher-Setup-1.5.7.exe",
-  "notes": "v1.5.7 显示真实性根修：① 运行时长只算当前这一轮真实运行——以操作系统进程启动时刻起算（跨启动器重启、跨开机都真实），旧实现把跨天累计值当运行时长显示（实测开机当天却显示 1天20小时）；② 异常状态如实显示——端口冲突/状态异常/启动失败/未配置 不再糊成「未运行 · 端口空闲 · 就绪」，标题栏同步变红/黄；③ attached 终端如实显示进程 PID（不再显示「检测中」）。"
+  "version": "1.5.8",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.8/ZAT-DSH-Launcher-Setup-1.5.8.exe",
+  "notes": "v1.5.8 紧急修复（新装用户 pnpm 安装失败）：① 安装包内嵌的 pnpm 只有 pnpm.exe、缺了它的 dist 目录（pnpm.exe 只是外壳，真正代码在 dist/pnpm.mjs）→ 新装用户执行 pnpm 安装 DSH 时必报 MODULE_NOT_FOUND，现已补全为完整一套；② 内嵌工具播种改为按完整性判定：目录存在但残缺（缺 dist 等）时自动补齐，已完整的目录一个字节都不动；③ pnpm 完整性把关：只有 exe、没有 dist 的缓存一律判为不可用，自愈时淘汰整个残缺目录并从内嵌副本或官方源重建，绝不拿残缺 exe 去装包。"
 }

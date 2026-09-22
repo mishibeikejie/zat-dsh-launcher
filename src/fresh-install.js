@@ -39,11 +39,44 @@ function embeddedToolsDir() {
   } catch { return '' }
 }
 
+// ★ 1.5.8 根修：standalone pnpm 的完整性判定。pnpm.exe 只是 SEA 外壳，真正的代码在同目录
+//   dist\pnpm.mjs；少了 dist 就会 MODULE_NOT_FOUND（实机：内嵌播种只带了 exe，用户 pnpm add 直接崩，
+//   栈帧 helpers:191 → pnpm.cjs:19 → embedding:93）。exe 存在 ≠ 可用，必须 exe + dist 配对。
+function pnpmStandaloneComplete(exePath) {
+  try {
+    if (!exePath || !fs.existsSync(exePath)) return false
+    return fs.existsSync(path.join(path.dirname(exePath), 'dist', 'pnpm.mjs'))
+  } catch { return false }
+}
+
+// 工具目录完整性：按工具形态判定（播种/复用前必须过这一关，否则"exe 在、依赖缺"会被当成可用）
+function toolDirComplete(name, dir) {
+  try {
+    if (!fs.existsSync(dir)) return false
+    if (/^pnpm-\d+\.\d+\.\d+$/.test(name)) return pnpmStandaloneComplete(path.join(dir, 'pnpm.exe'))
+    if (name === 'git') return fs.existsSync(path.join(dir, 'cmd', 'git.exe'))
+    if (name === 'node') return fs.existsSync(path.join(dir, 'node.exe'))
+    return true // 其它形态（npm 包目录等）没有约定结构，目录在即视为完整
+  } catch { return false }
+}
+
+// 补缺复制：只补目标里【没有】的条目，已有的绝不覆盖（用户/下载来的更新版本必须保住）。
+// 用于残缺缓存的原地修复——不删任何东西，只把缺的 dist/ 之类补齐。
+function copyMissingEntries(src, dest) {
+  fs.mkdirSync(dest, { recursive: true })
+  for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
+    const from = path.join(src, ent.name)
+    const to = path.join(dest, ent.name)
+    if (fs.existsSync(to)) continue
+    fs.cpSync(from, to, { recursive: true })
+  }
+}
+
 // ★ 1.5.6：安装包内嵌工具播种到永久缓存（node/git/pnpm 随启动器发布，首启只做本地复制，绝不联网）。
 //   1.5.5 的播种代码被误放在 normalToolsDir() 的 return 之后 = 永远不执行的死代码，内嵌工具从未生效
 //   （实机症状：zat-tools 里 node/pnpm 齐全、唯独 git 没播种 → 每次启动都联网下载 PortableGit，断网即全挂）。
-//   按【单工具目录】补缺：缓存里已有哪个工具就跳过哪个，只复制缺失的；已存在绝不覆盖。
-//   半截复制/损坏残留由各 ensure* 的自检（probe）删目录后走 ensureGit 等的重播种或联网兜底自愈。
+//   ★ 1.5.8：不再"目录存在就跳过"——目录存在但【不完整】（1.5.5~1.5.7 的安装包里 pnpm 只带了 exe、
+//   没有 dist）时按缺的条目补播；已有文件不动，避免覆盖更新的版本。
 function seedEmbeddedTools(persistentZat, onlyName = '') {
   try {
     const embedded = embeddedToolsDir()
@@ -54,8 +87,8 @@ function seedEmbeddedTools(persistentZat, onlyName = '') {
       const src = path.join(embedded, name)
       if (!fs.existsSync(src) || !fs.statSync(src).isDirectory()) continue
       const dest = path.join(persistentZat, name)
-      if (fs.existsSync(dest)) continue
-      fs.cpSync(src, dest, { recursive: true })
+      if (toolDirComplete(name, dest)) continue // 已完整 → 一个字节都不动
+      copyMissingEntries(src, dest)             // 缺失或残缺 → 只补缺的
     }
   } catch { /* 播种失败仍走正常自举/联网兜底 */ }
 }
@@ -238,15 +271,24 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run, skipOn
   const cached = path.join(dir, 'pnpm.mjs')
   const nodeBin = nodeExe && nodeExe !== 'pnpm' ? nodeExe : 'node'
   // ★ 用户原则：已有自带 pnpm（standalone/cjs）就绝不再联网探测/下载。
+  // ★ 1.5.8：standalone 必须 exe + dist 配对才算"有"；残缺（只有 exe）的版本目录直接删掉，
+  //   让后面的播种/下载把完整的一套重新落位——否则会拿着残缺 exe 去 pnpm add，必崩（实机根因）。
   try {
     const own = (() => {
       try {
-        const dirs = fs.readdirSync(dir).filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && fs.existsSync(path.join(dir, n, 'pnpm.exe'))).sort()
-        if (dirs.length) return path.join(dir, dirs[dirs.length - 1], 'pnpm.exe')
+        const dirs = fs.readdirSync(dir).filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n)).sort()
+        for (let i = dirs.length - 1; i >= 0; i--) {
+          const exe = path.join(dir, dirs[i], 'pnpm.exe')
+          if (!fs.existsSync(exe)) continue
+          if (pnpmStandaloneComplete(exe)) return exe
+          try { fs.rmSync(path.join(dir, dirs[i]), { recursive: true, force: true }) } catch { /* 删除失败则跳过 */ }
+        }
       } catch { /* 目录不可读则跳过 */ }
       for (const name of ['pnpm.exe', 'pnpm.cjs']) {
         const p = path.join(dir, name)
-        if (fs.existsSync(p)) return p
+        if (!fs.existsSync(p)) continue
+        if (name === 'pnpm.exe' && !pnpmStandaloneComplete(p)) continue // 顶层残缺 exe 同样不认
+        return p
       }
       return ''
     })()
@@ -262,15 +304,26 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run, skipOn
       const latestVer = await probeRegistryPnpmLatest(nodeBin, dir)
       const target = pickVerifiedPnpmVersion(latestVer)
       if (target) {
-        // ★ standalone 整体目录落位（pnpm.exe + dist 配对）
+        // ★ standalone 整体目录落位（pnpm.exe + dist 配对）——配对不完整一律视为不可用
         const exeEntry = path.join(dir, `pnpm-${target}`, 'pnpm.exe')
-        if (fs.existsSync(exeEntry)) {
-          const r = await run(nodeBin, [exeEntry, '--version'], null, 20000)
+        if (fs.existsSync(exeEntry) && pnpmStandaloneComplete(exeEntry)) {
+          const r = await run(exeEntry, ['--version'], null, 20000) // 直接执行 exe（不能经 node 跑 SEA 壳）
           if (r.ok && String(r.out || '').trim() === target) {
             if (onProgress) onProgress('依赖', `pnpm 官方版就绪：${target}`)
             return exeEntry
           }
-          try { fs.rmSync(exeEntry, { force: true }) } catch { /* 忽略 */ }
+        }
+        if (fs.existsSync(exeEntry)) {
+          // 残缺或体检失败：删整个版本目录（只删 exe 会留下缺 dist 的目录，导致播种跳过、永远修不好）
+          try { fs.rmSync(path.join(dir, `pnpm-${target}`), { recursive: true, force: true }) } catch { /* 忽略 */ }
+          seedEmbeddedTools(dir, `pnpm-${target}`) // 安装包内嵌副本优先补位（本地复制，秒级）
+          if (pnpmStandaloneComplete(exeEntry)) {
+            const r2 = await run(exeEntry, ['--version'], null, 20000)
+            if (r2.ok && String(r2.out || '').trim() === target) {
+              if (onProgress) onProgress('依赖', `pnpm 官方版就绪（内嵌播种）：${target}`)
+              return exeEntry
+            }
+          }
         }
         // ★ 1.5.3 用户原则：不再"复用系统已装的 pnpm"（那是摸用户系统）；
         //   自带缓存没有就官方下载 standalone（多镜像），零系统依赖。
@@ -287,17 +340,18 @@ async function ensurePnpm({ nodeExe, toolsDir, onProgress, execute = run, skipOn
   // 优先级先 try 自带 dir 的 standalone，再 cjs，最后才 mjs。绝不跨界摸用户系统。
   try {
     // 只在 dir（自带工具目录）范围内找——绝不 across 到系统 PATH / 用户安装位置
+    // ★ 1.5.8：standalone 一律要求 exe + dist 配对，残缺的不返回（否则 pnpm add 必崩）
     const scanDir = (base) => {
       try {
         const exes = fs.readdirSync(base)
-          .filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && fs.existsSync(path.join(base, n, 'pnpm.exe')))
+          .filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && pnpmStandaloneComplete(path.join(base, n, 'pnpm.exe')))
           .sort()
         if (exes.length) return path.join(base, exes[exes.length - 1], 'pnpm.exe')
       } catch { /* 忽略 */ }
-      for (const name of ['pnpm.exe', 'pnpm.cjs']) {
-        const p = path.join(base, name)
-        if (fs.existsSync(p)) return p
-      }
+      const topExe = path.join(base, 'pnpm.exe')
+      if (pnpmStandaloneComplete(topExe)) return topExe
+      const topCjs = path.join(base, 'pnpm.cjs')
+      if (fs.existsSync(topCjs)) return topCjs
       return ''
     }
     const own = scanDir(dir)
@@ -575,10 +629,12 @@ function findPnpm() {
   const toolDir = path.join(normalToolsDir(), 'zat-tools') // 长路径（8.3 短路径导致 ESM 解析失败）
   const candidates = [
     // ① 自带 standalone（pnpm-<ver>\pnpm.exe + dist 配对，版本数字排序取最高）——白板原则首选
+    //    ★ 1.5.8：必须 exe + dist 配对；残缺（1.5.5~1.5.7 内嵌包只带 exe）绝不返回，
+    //    否则被拿去 pnpm add 就是 MODULE_NOT_FOUND（实机大面积报错根因）。
     ...((() => {
       try {
         return fs.readdirSync(toolDir)
-          .filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && fs.existsSync(path.join(toolDir, n, 'pnpm.exe')))
+          .filter(n => /^pnpm-\d+\.\d+\.\d+$/.test(n) && pnpmStandaloneComplete(path.join(toolDir, n, 'pnpm.exe')))
           .map(n => path.join(toolDir, n, 'pnpm.exe'))
           .sort((a, b) => {
             const pa = (/pnpm-([\d.]+)/.exec(a) || [])[1].split('.').map(Number)
@@ -589,7 +645,8 @@ function findPnpm() {
       } catch { return [] }
     })()),
     // ② 自带其余形态（zat-tools 缓存目录，绝不跨出工具目录找系统）
-    path.join(toolDir, 'pnpm.exe'),
+    //    顶层 pnpm.exe 同样要求 exe + dist 配对；.cjs 是 JS 文件，node 直接跑，不涉及 dist
+    (() => { const p = path.join(toolDir, 'pnpm.exe'); return pnpmStandaloneComplete(p) ? p : '' })(),
     path.join(toolDir, 'pnpm.cjs'),
     // ★ 不再包含 pnpm.mjs：mjs 形态已被矩阵定论为 Windows worker 崩溃形态，任何情况下
     //   都不能被 findPnpm 直接选中作为"可用"；确保 ensurePnpm 先尝试 standalone/系统复用。
@@ -1643,7 +1700,7 @@ module.exports = {
   ensureNpmCli, installOfficialPackage, updateNpmPackage, installProfileBundles,
   ensureNodeExe, findCachedNode, patchDshSubprocessNoWindow, ensureNpmCommand, ensureUpdateToolchain,
   ensureGit, executablePnpm, ensureConsoleHostDll, spawnWithHiddenConsole, normalToolsDir,
-  embeddedToolsDir, seedEmbeddedTools,
+  embeddedToolsDir, seedEmbeddedTools, pnpmStandaloneComplete, toolDirComplete,
   findNodeGypPython,
   GIT_MIRRORS: gitPortableUrls, gitPortableUrls,
   executablePnpmOrRaw,

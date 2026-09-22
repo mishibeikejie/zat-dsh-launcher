@@ -74,13 +74,27 @@ test('ensurePnpm 自带 standalone 缓存存在时直接返回（1.5.3 原则：
   // ★ 1.5.3 用户原则：启动器自带工具齐全就永远只用自带，绝不摸用户系统。
   //   自带 standalone（pnpm-<ver>\pnpm.exe + dist 配对）优先；mjs 已从主路径剔除
   //   （官方 mjs 在 Windows 对最新依赖树 worker 稳定崩溃，矩阵实测 5/5）。
+  // ★ 1.5.8：配对完整性以 dist\pnpm.mjs 为准（exe 只是 SEA 壳）。
   const dir = tmp('zat-pnpm')
-  fs.mkdirSync(path.join(dir, 'pnpm-11.25.0'), { recursive: true })
-  fs.writeFileSync(path.join(dir, 'pnpm-11.25.0', 'pnpm.exe'), 'MZ-fake-exe')
   fs.mkdirSync(path.join(dir, 'pnpm-11.25.0', 'dist'), { recursive: true })
+  fs.writeFileSync(path.join(dir, 'pnpm-11.25.0', 'pnpm.exe'), 'MZ-fake-exe')
+  fs.writeFileSync(path.join(dir, 'pnpm-11.25.0', 'dist', 'pnpm.mjs'), 'mjs')
   const nodeExe = process.execPath
   const got = await ensurePnpm({ nodeExe, toolsDir: dir, skipOnline: true })
   assert.equal(got, path.join(dir, 'pnpm-11.25.0', 'pnpm.exe'))
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('ensurePnpm 残缺 standalone（只有 exe 没 dist）绝不返回（1.5.8 实机根因回归）', async () => {
+  // 实机事故：内嵌播种只带了 pnpm.exe，缺 dist → pnpm add 报 MODULE_NOT_FOUND。
+  // 残缺目录必须被淘汰（删掉整个版本目录），宁可返回 '' 也不能拿它去装包。
+  const dir = tmp('zat-pnpm-broken')
+  fs.mkdirSync(path.join(dir, 'pnpm-11.25.0'), { recursive: true })
+  fs.writeFileSync(path.join(dir, 'pnpm-11.25.0', 'pnpm.exe'), 'MZ-fake-exe')
+  const nodeExe = process.execPath
+  const got = await ensurePnpm({ nodeExe, toolsDir: dir, skipOnline: true })
+  assert.equal(got, '', '残缺 standalone 被当成可用返回了')
+  assert.ok(!fs.existsSync(path.join(dir, 'pnpm-11.25.0')), '残缺版本目录未被淘汰')
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
