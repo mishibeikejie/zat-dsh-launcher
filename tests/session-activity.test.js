@@ -6,7 +6,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { zstdCompressSync } = require('node:zlib')
-const { readSessions, extractSession, summarizeArgs, summarizeMessage } = require('../src/session-activity')
+const { readSessions, extractSession, summarizeArgs, summarizeMessage, listSessionFiles, findSessionFile } = require('../src/session-activity')
 function tmpDir(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `zat-sess-${label}-`))
 }
@@ -237,4 +237,68 @@ test('worker output keeps every terminal home isolated (no cross-terminal mixing
     assert.ok(!sumsA.includes('终端B'), 'homeA 混入了 homeB 的消息内容')
     assert.ok(!sumsB.includes('终端A'), 'homeB 混入了 homeA 的消息内容')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+// ★ 1.6.0：会话文件名随 DSH 版本变化（0.1.5 起 session.v3.jsonl.zstd，0.1.7 起 V4）。
+// 旧实现硬编码 session.jsonl(.zstd)：实测本机 0.1.5 环境 110 个会话里
+// 104 个 session.v3.jsonl.zstd + 4 个 session.v2.jsonl.zstd 全部读不到。
+test('findSessionFile 认版本化文件名（session.v3/v4.jsonl.zstd）', () => {
+  const dir = tmpDir('names')
+  try {
+    // 0.1.5 实际落盘名
+    fs.writeFileSync(path.join(dir, 'session.v3.jsonl.zstd'), 'x')
+    assert.equal(path.basename(findSessionFile(dir)), 'session.v3.jsonl.zstd')
+
+    // 0.1.7 的 V4 会话
+    fs.rmSync(path.join(dir, 'session.v3.jsonl.zstd'))
+    fs.writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), 'x')
+    assert.equal(path.basename(findSessionFile(dir)), 'session.v4.jsonl.zstd')
+
+    // 明文 V4
+    fs.rmSync(path.join(dir, 'session.v4.jsonl.zstd'))
+    fs.writeFileSync(path.join(dir, 'session.v4.jsonl'), 'x')
+    assert.equal(path.basename(findSessionFile(dir)), 'session.v4.jsonl')
+
+    // 老名字仍然认（不回归）
+    fs.rmSync(path.join(dir, 'session.v4.jsonl'))
+    fs.writeFileSync(path.join(dir, 'session.jsonl.zstd'), 'x')
+    assert.equal(path.basename(findSessionFile(dir)), 'session.jsonl.zstd')
+
+    // 无关文件不算会话
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'x')
+    fs.rmSync(path.join(dir, 'session.jsonl.zstd'))
+    assert.equal(findSessionFile(dir), null)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('同一目录多份会话文件：优先 .zstd，其次版本号大的', () => {
+  const dir = tmpDir('prefer')
+  try {
+    // 明文 V4 与压缩 V3：压缩优先（真实环境同一会话只会有一种）
+    fs.writeFileSync(path.join(dir, 'session.v4.jsonl'), 'x')
+    fs.writeFileSync(path.join(dir, 'session.v3.jsonl.zstd'), 'x')
+    assert.equal(path.basename(findSessionFile(dir)), 'session.v3.jsonl.zstd')
+
+    // 同为压缩：V4 胜 V3
+    fs.writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), 'x')
+    assert.equal(path.basename(findSessionFile(dir)), 'session.v4.jsonl.zstd')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('listSessionFiles 列出新版命名会话（两层与单层目录都认）', () => {
+  const home = tmpDir('listnames')
+  try {
+    const two = path.join(home, 'sessions', '--hash--', 's-v3')
+    const one = path.join(home, 'sessions', 's-v4')
+    writeZstdSession(path.join(two, 'session.v3.jsonl.zstd'), [{ type: 'session', id: 's-v3', createdAt: 1000 }])
+    writeZstdSession(path.join(one, 'session.v4.jsonl.zstd'), [{ type: 'session', id: 's-v4', createdAt: 2000 }])
+    const files = listSessionFiles(home)
+    assert.equal(files.length, 2, `应列出 2 个会话，实际 ${files.length}`)
+    assert.deepEqual(files.map(f => f.sid).sort(), ['s-v3', 's-v4'])
+    for (const f of files) assert.ok(f.fileSize > 0, '文件大小应可读')
+    // 端到端：readSessions 能读到内容（旧实现此处返回空数组）
+    const sessions = readSessions(home)
+    assert.equal(sessions.length, 2)
+    assert.deepEqual(sessions.map(s => s.id).sort(), ['s-v3', 's-v4'])
+  } finally { fs.rmSync(home, { recursive: true, force: true }) }
 })

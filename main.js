@@ -22,6 +22,7 @@ const terminalActivity = require('./src/terminal-activity')
 const sessionActivity = require('./src/session-activity')
 const { fetchSessionList } = require('./src/session-list')
 const { planTerminalDeletion } = require('./src/terminal-files')
+const { parsePluginManifest } = require('./src/web-probe')
 const toolchainExec = require('./src/toolchain-execute')
 const cliProbe = require('./src/cli-probe')
 
@@ -465,12 +466,10 @@ function probeWebErrorPage(targetUrl, timeoutMs = 6000) {
       try {
         if (!r || r.statusCode !== 200) return fail()
         // 页面 HTML 里的客户端模块清单（/plugins/??a/client.js,b/client.js&rev=...）
-        const m = String(r.body || '').match(/href="(\/plugins\/\?\?[^"]+)"/)
-        if (!m) return done({ ok: true, missing: [], moduleCount: 0 })
-        const pluginPath = m[1].replace(/&amp;/g, '&')
-        const listPart = pluginPath.split('??')[1] || ''
-        const moduleIds = new Set(decodeURIComponent(listPart.split('&')[0])
-          .split(',').map(s => s.replace(/\/client\.js.*$/i, '').trim()).filter(Boolean))
+        // ★ 1.6.0：解析抽到 src/web-probe.js —— 0.1.7 把清单换成 src="plugins/??…"（相对路径，
+        //   同页 3 处清单），只认 href + 绝对路径会一处都匹配不到（探测静默失效）。
+        const { pluginPath, moduleIds } = parsePluginManifest(String(r.body || ''))
+        if (!pluginPath) return done({ ok: true, missing: [], moduleCount: 0 })
         // 主 chunk（引导期已物化的模块）也视为已交付 —— 否则健康实例会被误报
         // （实机验证：store/primitives/slots 都在主 chunk，真缺席的 dockkit 两边皆无）
         const mainM = String(r.body || '').match(/src="(\.\/assets\/index-[^"]+\.js)"/)

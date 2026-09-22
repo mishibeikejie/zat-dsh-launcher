@@ -340,8 +340,33 @@ function extractSession(file, fromByte = 0) {
   return { header, title, tools, events }
 }
 
+// 会话文件名随 DSH 版本变化：早期 session.jsonl(.zstd)，0.1.5 起 session.v3.jsonl.zstd，
+// 0.1.7 起 V4 会话（session.v4.jsonl.zstd）。硬编码 session.jsonl(.zstd) 会漏掉全部带版本号的
+// 会话——实测本机 0.1.5 环境 110 个会话里 104 个 v3 + 4 个 v2 都读不到（统计只剩零星老会话）。
+// 统一按 session[.版本].jsonl[.zstd] 匹配。
+const SESSION_FILE_RE = /^session(?:\.[a-z0-9]+)?\.jsonl(?:\.zstd)?$/i
+
+// 版本号大小：session.v4.jsonl.zstd > session.v3.jsonl.zstd > session.jsonl.zstd（无版本号记 0）
+function sessionFileRank(name) {
+  const m = String(name).match(/^session\.v(\d+)\./i)
+  return m ? Number(m[1]) : 0
+}
+
+// 在会话目录里定位会话文件：优先压缩(.zstd)，同为压缩/明文时取版本号大的
+function findSessionFile(sessionDir) {
+  let names = []
+  try { names = fs.readdirSync(sessionDir) } catch { return null }
+  const matched = names.filter(n => SESSION_FILE_RE.test(n)).sort((a, b) => {
+    const az = /\.zstd$/i.test(a) ? 1 : 0
+    const bz = /\.zstd$/i.test(b) ? 1 : 0
+    if (az !== bz) return bz - az
+    return sessionFileRank(b) - sessionFileRank(a) || a.localeCompare(b)
+  })
+  return matched.length ? path.join(sessionDir, matched[0]) : null
+}
+
 // 扫描一个 DSH_HOME 的会话目录，只列文件信息（不读内容），按创建时间倒序。
-// 目录结构：<home>/sessions/<workspace-hash>/<sessionId>/session.jsonl(.zstd)，兼容无 hash 层。
+// 目录结构：<home>/sessions/<workspace-hash>/<sessionId>/session[.vN].jsonl(.zstd)，兼容无 hash 层。
 // 返回 [{ sid, file, fileSize, fileMtime }]（最多 limit 个）。
 // 供增量 worker 先对比文件变化再决定是否解压（避免每轮全量解压所有会话）。
 function listSessionFiles(home, limit = 50) {
@@ -349,9 +374,7 @@ function listSessionFiles(home, limit = 50) {
   if (!fs.existsSync(dir)) return []
   const results = []
   const consider = (sessionDir, sid) => {
-    const file = path.join(sessionDir, 'session.jsonl.zstd')
-    const plain = path.join(sessionDir, 'session.jsonl')
-    const f = fs.existsSync(file) ? file : fs.existsSync(plain) ? plain : null
+    const f = findSessionFile(sessionDir)
     if (!f) return
     let st
     try { st = fs.statSync(f) } catch { return }
@@ -367,7 +390,7 @@ function listSessionFiles(home, limit = 50) {
     // 两层结构：<hash>/<sessionId>/；单层：<sessionId>/
     let sub
     try { sub = fs.readdirSync(full) } catch { continue }
-    if (sub.some(s => fs.existsSync(path.join(full, s, 'session.jsonl')) || fs.existsSync(path.join(full, s, 'session.jsonl.zstd')))) {
+    if (sub.some(s => findSessionFile(path.join(full, s)))) {
       for (const sid of sub) consider(path.join(full, sid), sid)
     } else {
       consider(full, entry)
@@ -400,4 +423,4 @@ function readSessions(home, limit = 20) {
   return results.slice(0, limit)
 }
 
-module.exports = { readSessions, extractSession, listSessionFiles, summarizeArgs, summarizeEvent, summarizeMessage }
+module.exports = { readSessions, extractSession, listSessionFiles, findSessionFile, summarizeArgs, summarizeEvent, summarizeMessage }

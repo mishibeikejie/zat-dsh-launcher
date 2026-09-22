@@ -1,5 +1,5 @@
 {
-  "version": "1.5.8",
-  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.5.8/ZAT-DSH-Launcher-Setup-1.5.8.exe",
-  "notes": "v1.5.8 紧急修复（新装用户 pnpm 安装失败）：① 安装包内嵌的 pnpm 只有 pnpm.exe、缺了它的 dist 目录（pnpm.exe 只是外壳，真正代码在 dist/pnpm.mjs）→ 新装用户执行 pnpm 安装 DSH 时必报 MODULE_NOT_FOUND，现已补全为完整一套；② 内嵌工具播种改为按完整性判定：目录存在但残缺（缺 dist 等）时自动补齐，已完整的目录一个字节都不动；③ pnpm 完整性把关：只有 exe、没有 dist 的缓存一律判为不可用，自愈时淘汰整个残缺目录并从内嵌副本或官方源重建，绝不拿残缺 exe 去装包。"
+  "version": "1.6.0",
+  "url": "https://github.com/mishibeikejie/zat-dsh-launcher/releases/download/v1.6.0/ZAT-DSH-Launcher-Setup-1.6.0.exe",
+  "notes": "v1.6.0 适配 DSH 最新版（0.1.7）：① 引擎升到 0.8.0——0.1.7 收紧了插件清单校验（每个 codec 必须带 create() 工厂），旧引擎整份清单被拒收、22 个市场接口注册不上（市场能开、取不到数据），现已兼容 0.1.5 与 0.1.7 两代 DSH；② 「一键检测」的模块图探测适配 0.1.7 的新页面形态（清单从 href 绝对路径改为 src 相对路径、同页多处），旧解析在新版上一处都匹配不到会导致检测静默失效，现取条目最多的那份完整清单，既不再失效也不会误报缺模块；③ 「使用统计」适配新版会话文件命名（session.v3/v4.jsonl.zstd）：实测本机 110 个会话里 108 个读不到，现在全部可读；④ 全链路实测最新版 DSH 0.1.7-alpha.1：识别→安装→引擎注入→启动页面全部通过。"
 }
